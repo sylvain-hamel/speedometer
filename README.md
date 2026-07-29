@@ -26,7 +26,7 @@ is only needed to install and update.
 | | |
 |---|---|
 | **Big number** | Smoothed speed — the one you steer by. |
-| **GPS** | Position accuracy from the receiver, with a green / amber / red dot for signal quality. |
+| **GPS** | Position accuracy from the receiver, with a green / amber / red dot for fix quality. Tap it for the full status panel. |
 | **± MPH** | How much the raw reading is currently bouncing around. Small means the big number is solid; large means take it with a pinch of salt. |
 | **LIVE** | The unfiltered reading, straight from the GPS. Useful for seeing what the smoothing is doing for you. |
 
@@ -36,15 +36,36 @@ units, smoothing and the simulator.
 The start screen appears only on the very first launch. After that the app opens straight
 into the readout and starts acquiring a fix immediately.
 
-### When the signal isn't good
+### When the fix isn't good
 
-- **Under way and the fix drops** → the number blanks to `--` and says `GPS SIGNAL LOST`.
+- **Under way and the fix drops** → the number blanks to `--` and says `GPS FIX LOST`.
   It deliberately never leaves an old speed on screen looking live.
 - **Stopped and the fix goes quiet** → holds `0.0` and says `STOPPED`. Receivers throttle
   updates hard when nothing is moving, and treating that as an error would make the
   display flap between a number and a warning while you're tied up.
 - **Below about 0.2 MPH** → pinned to `0.0`, so stationary drift doesn't read as a phantom
   few tenths.
+
+### What the dot actually means
+
+It is called *fix quality*, not signal quality, because it isn't measuring reception. GPS is
+receive-only — your phone never talks to a satellite, so there is no connection to be up or
+down, and sitting still doesn't change what it can hear. Two things feed the colour:
+
+| | |
+|---|---|
+| **Position accuracy** | Green at or below 8 m, red above 35 m, amber between. |
+| **Fix age** | A fix older than 4 s downgrades the colour one step, however precise it is. |
+
+Both thresholds are sticky — green is only given up above 12 m, red only released at or
+below 25 m. Without that gap an accuracy reading hovering on a boundary, which is routine in
+chop, blinks the dot once a second with nothing actually changing.
+
+Tap the GPS reading for the panel behind all this: quality and why it's that colour, how
+long ago the last fix landed (*"3.4 seconds ago"*), the fix rate, raw versus smoothed speed,
+and the location permission state. While you are stopped, **last contact** and **last usable
+speed** drift apart — the receiver keeps reporting a position but declines to attach a speed
+to it, because at a standstill it can't separate real motion from its own noise.
 
 ## Install on iPhone
 
@@ -77,7 +98,7 @@ reading.
 | **Manual** | Holds whatever the slider is set to. |
 | **Troll** | Sweeps slowly between a crawl and about 3 MPH. |
 | **Chop** | Steady 1.3 MPH with wave action fighting you — the noisiest realistic case. |
-| **Dropout** | Good signal → degraded accuracy → total loss of fix. Shows every failure state. |
+| **Dropout** | Good fix → degraded accuracy → total loss of fix. Shows every failure state. |
 
 ## How the speed is worked out
 

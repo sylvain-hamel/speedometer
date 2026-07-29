@@ -218,7 +218,7 @@ async function newPage(over = {}) {
   const { ctx, page } = await newPage();
 
   // Moored: GPS goes quiet because nothing is moving. This must NOT flap into
-  // an error — that was the "GPS signal lost every few seconds" bug.
+  // an error — that was the "fix lost every few seconds" bug.
   const moored = await page.evaluate(() => {
     const S = window.__speedo;
     S.resetFilter();
@@ -233,7 +233,7 @@ async function newPage(over = {}) {
       dot: document.getElementById('gpsDot').className,
     };
   });
-  check('moored + GPS quiet: holds 0.0, never claims signal lost',
+  check('moored + GPS quiet: holds 0.0, never claims the fix is lost',
     moored.speed === '0.0' && moored.status === 'STOPPED'
       && moored.acc === '±5 m' && moored.dot.includes('fair'),
     JSON.stringify(moored));
@@ -271,9 +271,9 @@ async function newPage(over = {}) {
       dot: document.getElementById('gpsDot').className,
     };
   }, mphToMs(1.3));
-  check('under way then signal lost: blanks instead of showing an old speed as live',
-    stale.speed === '--' && stale.status === 'GPS SIGNAL LOST', JSON.stringify(stale));
-  check('under way then signal lost: every secondary readout blanks too',
+  check('under way then fix lost: blanks instead of showing an old speed as live',
+    stale.speed === '--' && stale.status === 'GPS FIX LOST', JSON.stringify(stale));
+  check('under way then fix lost: every secondary readout blanks too',
     stale.live === '--' && stale.acc === '--' && stale.dot.includes('poor'),
     JSON.stringify(stale));
 
@@ -292,7 +292,7 @@ async function newPage(over = {}) {
     denied.speed === '--' && denied.status === 'LOCATION ACCESS DENIED'
       && denied.cls.includes('state-error'), JSON.stringify(denied));
 
-  // Signal-quality dot thresholds
+  // Fix-quality dot thresholds
   const dots = await page.evaluate((v13) => {
     const S = window.__speedo;
     const at = (acc) => {
@@ -304,9 +304,61 @@ async function newPage(over = {}) {
     };
     return { good: at(6), fair: at(20), poor: at(60) };
   }, mphToMs(1.3));
-  check('signal dot: green / amber / red track GPS accuracy',
+  check('fix dot: green / amber / red track GPS accuracy',
     dots.good.includes('good') && dots.fair.includes('fair') && dots.poor.includes('poor'),
     JSON.stringify(dots));
+
+  // Hysteresis: the band only changes on a decisive move, so accuracy sitting on
+  // a boundary can't blink the dot at the fix rate. Pure function, so drive it
+  // directly rather than staging six different fix histories.
+  const hyst = await page.evaluate(() => {
+    const b = window.__speedo.accuracyBand;
+    return {
+      holdsGood:  b(10, 'good'),   // inside the 8-12 gap, was green -> stays green
+      holdsFair:  b(10, 'fair'),   // same reading, was amber -> stays amber
+      leavesGood: b(13, 'good'),   // past the exit threshold -> gives it up
+      entersGood: b(7,  'fair'),   // clearly good -> takes it
+      holdsPoor:  b(30, 'poor'),   // inside the 25-35 gap, was red -> stays red
+      holdsFair2: b(30, 'fair'),   // same reading, was amber -> stays amber
+      entersPoor: b(40, 'fair'),
+      leavesPoor: b(24, 'poor'),
+      coldGood:   b(6, null),      // no previous band -> the tighter thresholds
+      coldFair:   b(20, null),
+      coldPoor:   b(60, null),
+    };
+  });
+  check('fix dot: an accuracy reading on a boundary holds its band, both ways',
+    hyst.holdsGood === 'good' && hyst.holdsFair === 'fair'
+      && hyst.holdsPoor === 'poor' && hyst.holdsFair2 === 'fair',
+    JSON.stringify(hyst));
+  check('fix dot: a decisive move still changes the band',
+    hyst.leavesGood === 'fair' && hyst.entersGood === 'good'
+      && hyst.entersPoor === 'poor' && hyst.leavesPoor === 'fair',
+    JSON.stringify(hyst));
+  check('fix dot: first fix after a reset uses the tighter thresholds',
+    hyst.coldGood === 'good' && hyst.coldFair === 'fair' && hyst.coldPoor === 'poor',
+    JSON.stringify(hyst));
+
+  // The dot flicker this was built to kill: accuracy jittering across 10 m, the
+  // way it does in chop, used to repaint the dot on nearly every fix.
+  const flicker = await page.evaluate((v13) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    const seq = [9, 11, 9.5, 10.5, 9, 11.5, 10, 9.2, 11, 10.8];
+    const now = Date.now();
+    const seen = [];
+    seq.forEach((acc, i) => {
+      S.pushSample(v13, acc, now - (seq.length - 1 - i) * 1000);
+      S.state.lastContactAt = Date.now();
+      S.render();
+      seen.push(document.getElementById('gpsDot').className);
+    });
+    let changes = 0;
+    for (let i = 1; i < seen.length; i++) if (seen[i] !== seen[i - 1]) changes++;
+    return { changes, seen };
+  }, mphToMs(1.3));
+  check('fix dot: accuracy jittering across a threshold does not blink the dot',
+    flicker.changes === 0, JSON.stringify(flicker));
 
   await ctx.close();
 }
@@ -442,6 +494,129 @@ async function newPage(over = {}) {
   const held = await page.evaluate(() => document.getElementById('wakeHint').hidden);
   check('a tap anywhere on screen takes the lock and clears the hint',
     held === true, `hintHidden=${held}`);
+
+  await ctx.close();
+}
+
+/* ==========================================================================
+   3d. GPS status panel — tapping the dot explains what it is standing in for
+   ========================================================================== */
+{
+  const ctx = await browser.newContext({ viewport: { width: 393, height: 852 } });
+  await ctx.addInitScript(seed({ launched: true }));
+
+  // Silence the receiver rather than letting headless Chromium deny location:
+  // this section is about what the panel reports, so the fix history below has
+  // to be the only thing feeding it.
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, 'geolocation', {
+      configurable: true,
+      value: { watchPosition: () => 1, clearWatch() {} },
+    });
+  });
+
+  const page = await ctx.newPage();
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+
+  const closed = await page.evaluate(() =>
+    document.getElementById('debugSheet').classList.contains('open'));
+  check('GPS panel: stays out of the way until asked for',
+    closed === false, `open=${closed}`);
+
+  // Feed a known history, then open the panel the way a thumb would.
+  await page.evaluate((v13) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    const now = Date.now();
+    for (let i = 0; i < 8; i++) S.pushSample(v13, 6, now - (7 - i) * 1000);
+    S.state.lastContactAt = now - 3400;      // last contact 3.4 s ago
+  }, mphToMs(1.3));
+  await page.click('#gpsMetric');
+  await page.waitForTimeout(300);
+
+  const panel = await page.evaluate(() => {
+    const t = (id) => document.getElementById(id).textContent;
+    return {
+      open: document.getElementById('debugSheet').classList.contains('open'),
+      quality: t('dbgQuality'),
+      dot: document.getElementById('dbgDot').className,
+      acc: t('dbgAcc'),
+      contact: t('dbgContact'),
+      fix: t('dbgFix'),
+      rate: t('dbgRate'),
+      samples: t('dbgSamples'),
+      smoothed: t('dbgSmoothed'),
+      raw: t('dbgRaw'),
+      why: t('dbgWhy'),
+      source: t('dbgSource'),
+    };
+  });
+  check('GPS panel: tapping the GPS reading opens it',
+    panel.open === true, JSON.stringify(panel));
+  check('GPS panel: reports the band, the accuracy and why it is that colour',
+    panel.quality === 'Good' && panel.dot.includes('good')
+      && panel.acc === '±6.0 m' && panel.why.length > 0,
+    JSON.stringify(panel));
+  check('GPS panel: says how long ago the last fix landed, in seconds',
+    /^3\.[3-9] seconds ago$/.test(panel.contact) && /seconds ago$/.test(panel.fix),
+    JSON.stringify(panel));
+  check('GPS panel: fix rate, sample count and both speeds populate',
+    /every 1\.0 s/.test(panel.rate) && panel.samples === '8'
+      && /MPH$/.test(panel.smoothed) && /MPH$/.test(panel.raw)
+      && panel.source === 'Device GPS',
+    JSON.stringify(panel));
+
+  // The age has to keep counting while you look at it — a frozen number here
+  // would be worse than none, since the whole point is spotting a stalled fix.
+  const before = parseFloat(panel.contact);
+  await page.waitForTimeout(1200);
+  const after = await page.evaluate(() =>
+    parseFloat(document.getElementById('dbgContact').textContent));
+  check('GPS panel: the age counts up live rather than freezing on open',
+    after > before + 0.8, `${before} -> ${after}`);
+
+  // The panel exists to explain the dot, so its own dot must never disagree
+  // with the one in the strip — including on the aging downgrade, where a
+  // precise fix still shows amber.
+  const agree = await page.evaluate((v13) => {
+    const S = window.__speedo;
+    const at = (ageMs, acc) => {
+      S.resetFilter();
+      const now = Date.now();
+      for (let i = 0; i < 6; i++) S.pushSample(v13, acc, now - (5 - i) * 1000);
+      S.state.lastContactAt = Date.now() - ageMs;
+      S.render();
+      return {
+        panel: document.getElementById('dbgDot').className,
+        strip: document.getElementById('gpsDot').className,
+        word: document.getElementById('dbgQuality').textContent,
+      };
+    };
+    return {
+      fresh: at(500, 6),
+      aging: at(6000, 6),      // precise but late -> downgraded to amber
+      mediocre: at(500, 20),
+      bad: at(500, 60),
+    };
+  }, mphToMs(1.3));
+  const matches = Object.values(agree).every((r) => r.panel === r.strip);
+  check('GPS panel: its dot never disagrees with the one in the strip',
+    matches, JSON.stringify(agree));
+  check('GPS panel: names the band in words, downgrade included',
+    agree.fresh.word === 'Good' && agree.aging.word === 'Fair'
+      && agree.mediocre.word === 'Fair' && agree.bad.word === 'Poor',
+    JSON.stringify(agree));
+
+  await page.click('#debugDoneBtn');
+  await page.waitForTimeout(300);
+  const dismissed = await page.evaluate(() => ({
+    sheet: document.getElementById('debugSheet').classList.contains('open'),
+    backdrop: document.getElementById('backdrop').classList.contains('open'),
+  }));
+  check('GPS panel: Done closes it and clears the backdrop',
+    dismissed.sheet === false && dismissed.backdrop === false,
+    JSON.stringify(dismissed));
 
   await ctx.close();
 }

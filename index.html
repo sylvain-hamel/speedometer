@@ -215,6 +215,10 @@ body.state-error .status-line { color: var(--red); }
 .dot.fair { background: var(--orange); box-shadow: 0 0 8px rgba(255, 159, 10, 0.5); }
 .dot.poor { background: var(--red);    box-shadow: 0 0 8px rgba(255, 69, 58, 0.5); }
 
+/* The GPS cell opens the status panel. Same hit area as before, just tappable. */
+.metric-tap { cursor: pointer; border-radius: 10px; transition: background-color 120ms ease; }
+.metric-tap:active { background: var(--fill-2); }
+
 /* ===========================================================================
    Start overlay — the tap that buys us the geolocation prompt and wake lock
    =========================================================================== */
@@ -394,6 +398,14 @@ input[type="range"]::-moz-range-thumb {
 .slider-cap { font-size: 12px; color: var(--label-3); flex: none; }
 
 .hidden-block { display: none; }
+
+/* --- GPS status panel ---------------------------------------------------- */
+.row-value .dot { margin-right: 7px; vertical-align: baseline; display: inline-block; }
+/* Brighter than .row-note: this line is live state, not standing help text. */
+.dbg-why {
+  font-size: 12px; color: var(--label-2); line-height: 1.4;
+  padding: 8px 6px 0;
+}
 </style>
 </head>
 <body>
@@ -419,7 +431,7 @@ input[type="range"]::-moz-range-thumb {
   </div>
 
   <div class="metrics">
-    <div class="metric">
+    <div class="metric metric-tap" id="gpsMetric" role="button" tabindex="0" aria-label="GPS status">
       <div class="metric-value"><span class="dot" id="gpsDot"></span><span id="gpsAcc">--</span></div>
       <div class="metric-label">GPS</div>
     </div>
@@ -558,6 +570,93 @@ input[type="range"]::-moz-range-thumb {
     <div class="row-note">
       Open source, and it collects nothing — no analytics, no accounts, no network requests.
       Your position is read, shown on screen, and discarded.
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="debugSheet" role="dialog" aria-modal="true" aria-label="GPS status">
+  <div class="grabber"></div>
+  <div class="sheet-head">
+    <div class="sheet-title">GPS status</div>
+    <button class="sheet-done" id="debugDoneBtn">Done</button>
+  </div>
+
+  <div class="sheet-body">
+    <div class="group-label">Fix</div>
+    <div class="group">
+      <div class="row">
+        <div class="row-title">Quality</div>
+        <div class="row-value"><span class="dot" id="dbgDot"></span><span id="dbgQuality">--</span></div>
+      </div>
+      <div class="row">
+        <div class="row-title">Position accuracy</div>
+        <div class="row-value" id="dbgAcc">--</div>
+      </div>
+    </div>
+    <div class="dbg-why" id="dbgWhy"></div>
+    <div class="row-note">
+      Accuracy is how precisely the receiver reports knowing your <em>position</em>. It is not
+      reception strength — GPS is receive-only, so there is no connection to drop — and it is
+      not speed accuracy, which the browser never exposes. Speed comes from Doppler shift and
+      stays good even when this figure does not.
+    </div>
+
+    <div class="group-label">Timing</div>
+    <div class="group">
+      <div class="row">
+        <div class="row-title">Last contact</div>
+        <div class="row-value" id="dbgContact">never</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Last usable speed</div>
+        <div class="row-value" id="dbgFix">never</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Fix rate</div>
+        <div class="row-value" id="dbgRate">--</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Samples held</div>
+        <div class="row-value" id="dbgSamples">0</div>
+      </div>
+    </div>
+    <div class="row-note">
+      Those two differ while you are stopped: the receiver keeps reporting a position but
+      declines to put a speed on it, because at a standstill it cannot tell real motion from
+      its own noise. Long gaps when moored are normal — iOS throttles updates hard when
+      nothing is moving.
+    </div>
+
+    <div class="group-label">Speed</div>
+    <div class="group">
+      <div class="row">
+        <div class="row-title">Smoothed</div>
+        <div class="row-value" id="dbgSmoothed">--</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Raw</div>
+        <div class="row-value" id="dbgRaw">--</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Spread</div>
+        <div class="row-value" id="dbgSpread">--</div>
+      </div>
+    </div>
+
+    <div class="group-label">Source</div>
+    <div class="group">
+      <div class="row">
+        <div class="row-title">Reading from</div>
+        <div class="row-value" id="dbgSource">--</div>
+      </div>
+      <div class="row">
+        <div class="row-title">State</div>
+        <div class="row-value" id="dbgStatus">--</div>
+      </div>
+      <div class="row">
+        <div class="row-title">Location permission</div>
+        <div class="row-value" id="dbgPermission">--</div>
+      </div>
     </div>
   </div>
 </div>

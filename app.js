@@ -26,12 +26,22 @@ const SPREAD_WINDOW_MS = 10000; // window used for the ± figure
 const SAMPLE_KEEP_MS  = 20000;  // ring buffer retention
 const DEADBAND_MS     = 0.089;  // ~0.2 MPH. Below this, show a hard 0.0
 const STALE_MS        = 12000;  // no contact from the receiver at all for this long
-const AGING_MS        = 4000;   // fix older than this -> downgrade signal quality
+const AGING_MS        = 4000;   // fix older than this -> downgrade fix quality
 const STOPPED_MS      = 0.223;  // ~0.5 MPH. Below this we were moored, not moving
 const RENDER_MS       = 200;
 
-const ACC_GOOD = 10;            // metres
-const ACC_FAIR = 30;
+/* Fix-quality bands, in metres of reported position accuracy.
+ *
+ * Each boundary has a separate enter and exit threshold. Without that gap a
+ * reading sitting on a boundary flips the dot at the fix rate — accuracy
+ * wobbling either side of 10 m is routine in chop, and the dot would blink
+ * green/amber roughly once a second with nothing actually changing. A light
+ * that flickers for no reason is one you learn to ignore, which costs you the
+ * red state too, and red is the one that matters. */
+const ACC_GOOD_ENTER = 8;       // metres; become green at or below this
+const ACC_GOOD_EXIT  = 12;      // ...and stay green until above this
+const ACC_POOR_ENTER = 35;      // become red above this
+const ACC_POOR_EXIT  = 25;      // ...and stay red until at or below this
 
 /* Smoothing is stored as the EMA time constant, but shown to the user as a
  * settle time, because "6 seconds" on a slider naturally reads as "takes six
@@ -53,7 +63,7 @@ const SCENARIO_NOTES = {
   manual:  'Holds whatever speed you set on the slider, with a little GPS noise on top.',
   troll:   'Sweeps slowly between a crawl and about 3 MPH, the way a troll pass tends to go.',
   chop:    'Steady 1.3 MPH with wave action fighting you — the noisiest realistic case.',
-  dropout: 'Good signal, then degraded accuracy, then a total loss of fix. Shows every failure state.',
+  dropout: 'Good fix, then degraded accuracy, then a total loss of fix. Shows every failure state.',
 };
 
 /* --- element handles ----------------------------------------------------- */
@@ -66,6 +76,7 @@ const el = {
   statusLine: $('statusLine'),
   gpsDot:     $('gpsDot'),
   gpsAcc:     $('gpsAcc'),
+  gpsMetric:  $('gpsMetric'),
   speedVar:   $('speedVar'),
   varLabel:   $('varLabel'),
   liveSpeed:  $('liveSpeed'),
@@ -90,6 +101,22 @@ const el = {
   simSpeedSlider: $('simSpeedSlider'),
   simSpeedValue: $('simSpeedValue'),
   simSpeedMax: $('simSpeedMax'),
+  debugSheet: $('debugSheet'),
+  debugDoneBtn: $('debugDoneBtn'),
+  dbgDot:     $('dbgDot'),
+  dbgQuality: $('dbgQuality'),
+  dbgWhy:     $('dbgWhy'),
+  dbgAcc:     $('dbgAcc'),
+  dbgContact: $('dbgContact'),
+  dbgFix:     $('dbgFix'),
+  dbgRate:    $('dbgRate'),
+  dbgSamples: $('dbgSamples'),
+  dbgSmoothed: $('dbgSmoothed'),
+  dbgRaw:     $('dbgRaw'),
+  dbgSpread:  $('dbgSpread'),
+  dbgSource:  $('dbgSource'),
+  dbgStatus:  $('dbgStatus'),
+  dbgPermission: $('dbgPermission'),
 };
 
 /* --- persisted settings -------------------------------------------------- */
@@ -119,6 +146,7 @@ const state = {
   lastContactAt: 0,   // last time the receiver called us at all (see noteContact)
   lastRaw: null,      // most recent unfiltered speed, m/s
   lastAcc: null,
+  accBand: null,      // last accuracy band shown, so the thresholds can be sticky
   error: null,        // human-readable fatal error, or null
   started: false,
 };
@@ -170,9 +198,9 @@ function pushSample(speedMs, accuracy, when) {
  * This matters more than it sounds. A boat sitting still produces fixes whose
  * speed iOS reports as null, and whose position hasn't moved enough to derive
  * one from — and Core Location throttles updates hard when nothing is moving.
- * Treating that silence as "signal lost" makes the display flap between a
- * number and an error every few seconds while you're tied up. Contact is
- * therefore tracked separately from usable speed.
+ * Treating that silence as a lost fix makes the display flap between a number
+ * and an error every few seconds while you're tied up. Contact is therefore
+ * tracked separately from usable speed.
  */
 function noteContact(accuracy, when) {
   state.lastContactAt = when || Date.now();
@@ -188,7 +216,30 @@ function resetFilter() {
   state.lastContactAt = 0;
   state.lastRaw = null;
   state.lastAcc = null;
+  state.accBand = null;
   state.error = null;
+}
+
+/**
+ * Which fix-quality band an accuracy reading falls in, given the band currently
+ * on screen.
+ *
+ * Improving needs the tighter ENTER threshold, degrading the looser EXIT one,
+ * so a reading hovering on a boundary holds whatever it is already showing. On
+ * the first fix after a reset there is no previous band and the ENTER
+ * thresholds decide.
+ *
+ * Worth being clear about what this measures: it is the receiver's *position*
+ * error estimate, not reception quality and not speed accuracy. The Geolocation
+ * API exposes no satellite count, no signal strength and no speed accuracy, so
+ * this figure plus the age of the fix is genuinely all the app has to go on.
+ */
+function accuracyBand(acc, prev) {
+  const goodMax = prev === 'good' ? ACC_GOOD_EXIT : ACC_GOOD_ENTER;
+  const fairMax = prev === 'poor' ? ACC_POOR_EXIT : ACC_POOR_ENTER;
+  if (acc <= goodMax) return 'good';
+  if (acc <= fairMax) return 'fair';
+  return 'poor';
 }
 
 function median(arr) {
@@ -403,27 +454,48 @@ function render() {
     // Never keep displaying an old speed as if it were live — that is the one
     // failure mode that could actually mislead you on the water.
     setSpeed('--');
-    setText(el.statusLine, 'status', 'GPS SIGNAL LOST');
+    setText(el.statusLine, 'status', 'GPS FIX LOST');
   } else {
     const ms = (stale || state.ema < DEADBAND_MS) ? 0 : state.ema;
     setSpeed((ms * u.perMs).toFixed(1));
     setText(el.statusLine, 'status', stale ? 'STOPPED' : '');
   }
 
-  // --- GPS accuracy + quality dot ---
+  // --- GPS accuracy + fix-quality dot ---
+  //
+  // Two separate things feed this: how precisely the receiver reports knowing
+  // your position, and how long ago it last said anything. Neither is reception
+  // quality — GPS is receive-only, so there is no link to be up or down, and
+  // sitting still doesn't change what the phone can hear.
   let cls = '';
+  let why = '';
   if (!state.error && state.lastAcc != null && !quiet) {
+    const band = accuracyBand(state.lastAcc, state.accBand);
+    state.accBand = band;
+
+    // An aging fix is downgraded a step on top of whatever the accuracy says:
+    // a precise reading several seconds old still describes where you were.
     const aging = age > AGING_MS;
-    if (state.lastAcc <= ACC_GOOD) cls = aging ? 'fair' : 'good';
-    else if (state.lastAcc <= ACC_FAIR) cls = aging ? 'poor' : 'fair';
-    else cls = 'poor';
+    cls = !aging ? band : band === 'good' ? 'fair' : 'poor';
+    why = aging
+      ? 'Position accuracy is ' + band + ', but the fix is more than '
+        + Math.round(AGING_MS / 1000) + ' s old — downgraded a step.'
+      : 'Position accuracy is ' + band + ', and the fix is current.';
     setText(el.gpsAcc, 'acc', '±' + Math.round(state.lastAcc) + ' m');
   } else if (!state.error && state.lastAcc != null && stale) {
     // Moored: the fix is old but still the truth, so keep showing it, amber.
+    state.accBand = null;
     cls = 'fair';
+    why = 'Holding the last fix. You are stopped, so the receiver went quiet — '
+        + 'normal, and not a reception problem.';
     setText(el.gpsAcc, 'acc', '±' + Math.round(state.lastAcc) + ' m');
   } else {
+    state.accBand = null;
     cls = state.error || lost ? 'poor' : '';
+    why = state.error ? 'No fix — ' + state.error.toLowerCase() + '.'
+      : lost ? 'Nothing from the receiver for over ' + Math.round(STALE_MS / 1000)
+        + ' s while under way.'
+      : 'Waiting for a first fix.';
     setText(el.gpsAcc, 'acc', '--');
   }
   if (shown.dot !== cls) {
@@ -441,6 +513,86 @@ function render() {
   } else {
     setText(el.liveSpeed, 'live', (state.lastRaw * u.perMs).toFixed(1));
   }
+
+  renderDebug(now, u, { cls, why, sd, lost, stale });
+}
+
+/* --- GPS status panel ---------------------------------------------------- */
+
+/**
+ * Tapping the GPS reading opens this. The strip at the bottom has room for one
+ * number per metric; this is where the rest of it goes — in particular *when*
+ * the last fix actually landed, which is the thing the dot compresses into a
+ * colour and which explains most surprising readings.
+ */
+let debugOpen = false;
+
+const BAND_WORDS = { good: 'Good', fair: 'Fair', poor: 'Poor', '': 'None' };
+
+/** "3.4 seconds ago" — deliberately not a clock time; the age is the useful part. */
+function agoText(ts, now) {
+  if (!ts) return 'never';
+  const s = Math.max(0, (now - ts) / 1000);
+  if (s < 60) return s.toFixed(1) + ' seconds ago';
+  const m = Math.floor(s / 60);
+  return m + ' min ' + Math.round(s - m * 60) + ' s ago';
+}
+
+/** Mean gap between the fixes still in the buffer, in seconds. */
+function fixInterval() {
+  const s = state.samples;
+  if (s.length < 2) return null;
+  return (s[s.length - 1].t - s[0].t) / (s.length - 1) / 1000;
+}
+
+function renderDebug(now, u, r) {
+  if (!debugOpen) return;
+
+  const statusWord = state.error ? state.error
+    : state.ema === null ? 'Waiting for a first fix'
+    : r.lost ? 'Fix lost'
+    : r.stale ? 'Stopped — receiver quiet'
+    : 'Live';
+
+  setText(el.dbgSource, 'dbgSource',
+    settings.sim ? 'Simulator — ' + settings.scenario : 'Device GPS');
+  setText(el.dbgStatus, 'dbgStatus', statusWord);
+
+  setText(el.dbgQuality, 'dbgQuality', BAND_WORDS[r.cls] || 'None');
+  if (shown.dbgDot !== r.cls) {
+    shown.dbgDot = r.cls;
+    el.dbgDot.className = 'dot' + (r.cls ? ' ' + r.cls : '');
+  }
+  setText(el.dbgWhy, 'dbgWhy', r.why);
+
+  setText(el.dbgAcc, 'dbgAcc',
+    state.lastAcc == null ? '--' : '±' + state.lastAcc.toFixed(1) + ' m');
+  setText(el.dbgContact, 'dbgContact', agoText(state.lastContactAt, now));
+  setText(el.dbgFix, 'dbgFix', agoText(state.lastFixAt, now));
+
+  const iv = fixInterval();
+  setText(el.dbgRate, 'dbgRate', iv === null ? '--' : 'every ' + iv.toFixed(1) + ' s');
+  setText(el.dbgSamples, 'dbgSamples', String(state.samples.length));
+
+  setText(el.dbgSmoothed, 'dbgSmoothed',
+    state.ema === null ? '--' : (state.ema * u.perMs).toFixed(2) + ' ' + u.label);
+  setText(el.dbgRaw, 'dbgRaw',
+    state.lastRaw === null ? '--' : (state.lastRaw * u.perMs).toFixed(2) + ' ' + u.label);
+  setText(el.dbgSpread, 'dbgSpread',
+    r.sd === null ? '--' : '±' + (r.sd * u.perMs).toFixed(2) + ' ' + u.label);
+}
+
+/* Safari has historically not answered permissions.query for geolocation, so
+ * this is best-effort and reads "unavailable" rather than failing the panel. */
+async function refreshPermission() {
+  let text = 'unavailable';
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const st = await navigator.permissions.query({ name: 'geolocation' });
+      text = st.state;
+    }
+  } catch (_) {}
+  setText(el.dbgPermission, 'dbgPerm', text);
 }
 
 /* --- wake lock ----------------------------------------------------------- */
@@ -531,7 +683,29 @@ function applySource() {
 
 el.menuBtn.addEventListener('click', openSheet);
 el.doneBtn.addEventListener('click', closeSheet);
-el.backdrop.addEventListener('click', closeSheet);
+el.backdrop.addEventListener('click', () => { closeSheet(); closeDebug(); });
+
+// Tapping the GPS reading opens the status panel — the dot is one colour
+// standing in for several different situations, and this says which one.
+function openDebug() {
+  debugOpen = true;
+  render();               // populate before the sheet slides in, not after
+  refreshPermission();
+  el.debugSheet.classList.add('open');
+  el.backdrop.classList.add('open');
+}
+
+function closeDebug() {
+  debugOpen = false;
+  el.debugSheet.classList.remove('open');
+  el.backdrop.classList.remove('open');
+}
+
+el.gpsMetric.addEventListener('click', openDebug);
+el.gpsMetric.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDebug(); }
+});
+el.debugDoneBtn.addEventListener('click', closeDebug);
 
 // Tapping the unit under the number cycles it — no need to open Settings.
 function cycleUnit() {
@@ -657,6 +831,6 @@ if (typeof window !== 'undefined') {
   window.__speedo = {
     state, settings, UNITS, SETTLE_FACTOR,
     pushSample, resetFilter, speedSpread, median, render, syncSheet, applySource,
-    start, saveSettings,
+    start, saveSettings, accuracyBand, openDebug, closeDebug, agoText,
   };
 }
