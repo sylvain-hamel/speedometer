@@ -143,11 +143,38 @@ body.sim-on .sim-badge { opacity: 1; }
 }
 .speed-unit:active { background: var(--fill-2); }
 
+/* --- trolling target ----------------------------------------------------- */
+
+/* The whole point of the feature: the number itself carries the verdict, so a
+   glance from the helm is enough without reading anything. */
+.speed-value.zone-in   { color: var(--green); }
+.speed-value.zone-near { color: var(--orange); }
+.speed-value.zone-out  { color: var(--red); }
+
+.target-line {
+  margin-top: 8px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  white-space: nowrap;
+  transition: opacity 200ms ease;
+}
+.target-line[hidden] { display: none; }
+
 /* Degraded states: the number dims and greys so a stale reading can never be
-   mistaken for a live one. */
+   mistaken for a live one.
+
+   These deliberately sit *after* the .zone-* rules and outrank them — (0,2,1)
+   against (0,2,0) — because a grey "we don't know" must always beat a coloured
+   verdict. Colouring a stale number green would be the worst bug this app
+   could have. */
 body.state-stale .speed-value,
 body.state-error .speed-value { color: var(--label-3); }
 body.state-error .speed-unit  { color: var(--label-3); }
+body.state-stale .target-line,
+body.state-error .target-line { opacity: 0.4; }
 
 .status-line {
   margin-top: 10px;
@@ -393,6 +420,93 @@ input[type="range"]::-moz-range-thumb {
 .slider-row { display: flex; align-items: center; gap: 12px; }
 .slider-cap { font-size: 12px; color: var(--label-3); flex: none; }
 
+/* --- species list --------------------------------------------------------- */
+
+.species-row { cursor: pointer; gap: 10px; }
+.species-row:active { background: var(--fill-2); }
+
+/* Fixed-width so every name starts at the same x whether ticked or not —
+   without it the whole list shifts sideways as you change selection. */
+.species-tick {
+  width: 20px; flex: none;
+  color: var(--blue);
+  display: grid; place-items: center;
+}
+.species-tick svg { width: 16px; height: 16px; display: block; }
+.species-tick[data-on="false"] svg { visibility: hidden; }
+
+/* Name over range, rather than side by side: a species called "Rainbow trout /
+   arc-en-ciel" and a range competing for one line meant every name truncated to
+   an ellipsis, which is the one thing this list has to get right. */
+.species-text {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.species-name {
+  font-size: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.species-range {
+  font-size: 13px; color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  white-space: nowrap;
+}
+
+/* 44pt tall to stay a legal touch target, but pulled tight vertically with
+   negative margin so it doesn't stretch the row it sits in. */
+.species-edit {
+  width: 34px; height: 44px; margin: -10px -4px -10px 0;
+  flex: none;
+  display: grid; place-items: center;
+  background: none; border: 0; cursor: pointer;
+  color: var(--label-3);
+  border-radius: 8px;
+}
+.species-edit:active { color: var(--label); }
+.species-edit svg { width: 17px; height: 17px; display: block; }
+
+.species-empty {
+  font-size: 15px; color: var(--label-3);
+  padding: 14px; text-align: center;
+}
+
+/* --- editor --------------------------------------------------------------- */
+
+.text-input {
+  flex: 1; min-width: 0;
+  font-family: inherit;
+  /* 16px exactly: iOS Safari zooms the page when you focus anything smaller,
+     and there is no way back out of that zoom in a standalone web app. */
+  font-size: 16px;
+  color: var(--label);
+  background: transparent;
+  border: 0; outline: none;
+  text-align: right;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.text-input::placeholder { color: var(--label-3); }
+
+.row-btn {
+  flex: 1;
+  font-family: inherit;
+  font-size: 16px; font-weight: 600;
+  color: var(--blue);
+  background: none; border: 0; cursor: pointer;
+  padding: 13px 8px;
+  border-radius: 10px;
+}
+.row-btn:active { background: var(--fill-2); }
+.row-btn.danger { color: var(--red); }
+.row-btn.plain  { font-weight: 400; color: var(--label-2); }
+
+.btn-row { display: flex; gap: 8px; padding: 0; }
+.btn-row .row-btn + .row-btn { border-left: 0.5px solid var(--separator); border-radius: 10px; }
+
+/* For a group that follows another group directly, with no label between. */
+.group-gap { margin-top: 10px; }
+
 .hidden-block { display: none; }
 </style>
 </head>
@@ -414,6 +528,7 @@ input[type="range"]::-moz-range-thumb {
   <div class="readout">
     <div class="speed-value" id="speedValue">--</div>
     <div class="speed-unit" id="unitLabel" role="button" tabindex="0" aria-label="Change units">MPH</div>
+    <div class="target-line" id="targetLine" hidden></div>
     <div class="status-line" id="statusLine"></div>
     <button class="wake-hint" id="wakeHint" hidden>Tap anywhere to keep screen on</button>
   </div>
@@ -457,6 +572,112 @@ input[type="range"]::-moz-range-thumb {
           <button role="radio" data-unit="mph" aria-checked="true">MPH</button>
           <button role="radio" data-unit="kn"  aria-checked="false">Knots</button>
           <button role="radio" data-unit="kmh" aria-checked="false">km/h</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group-label">Trolling target</div>
+    <div class="group">
+      <div class="row">
+        <div class="row-title">Speed target</div>
+        <label class="switch">
+          <input type="checkbox" id="targetToggle">
+          <span></span>
+        </label>
+      </div>
+    </div>
+    <div class="row-note">
+      Colours the big number against a recommended trolling speed for whatever you're
+      after — green inside the range, amber near it, red well outside. The starting
+      numbers are a decent opening guess, not gospel: every species is editable, and
+      you can add your own.
+    </div>
+
+    <div id="targetOptions" class="hidden-block">
+      <div class="group-label">Species</div>
+      <div class="group" id="speciesList"></div>
+      <div class="group group-gap">
+        <div class="row row-link" id="addSpeciesBtn" role="button" tabindex="0">
+          <div class="row-title">Add a species</div>
+          <svg class="row-arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M8 3v10"></path><path d="M3 8h10"></path>
+          </svg>
+        </div>
+      </div>
+
+      <div id="speciesEditor" class="hidden-block">
+        <div class="group-label" id="editorTitle">Edit species</div>
+        <div class="group">
+          <div class="row">
+            <div class="row-title">Name</div>
+            <input class="text-input" id="speciesName" type="text" maxlength="32"
+                   placeholder="Species" autocomplete="off" autocapitalize="words"
+                   autocorrect="off" spellcheck="false" enterkeyhint="done">
+          </div>
+          <div class="row">
+            <div class="row-title">Slowest</div>
+            <div class="row-value" id="minValue">--</div>
+          </div>
+          <div class="row row-stack">
+            <div class="slider-row">
+              <span class="slider-cap">0</span>
+              <input type="range" id="minSlider" min="0" max="8" step="0.1" value="0.5">
+              <span class="slider-cap editor-cap">8</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="row-title">Fastest</div>
+            <div class="row-value" id="maxValue">--</div>
+          </div>
+          <div class="row row-stack">
+            <div class="slider-row">
+              <span class="slider-cap">0</span>
+              <input type="range" id="maxSlider" min="0" max="8" step="0.1" value="1.3">
+              <span class="slider-cap editor-cap">8</span>
+            </div>
+          </div>
+        </div>
+        <div class="group group-gap">
+          <div class="row btn-row">
+            <button class="row-btn plain" id="editorCancel">Cancel</button>
+            <button class="row-btn" id="editorSave">Save</button>
+          </div>
+        </div>
+        <div class="group group-gap hidden-block" id="deleteGroup">
+          <div class="row btn-row">
+            <button class="row-btn danger" id="editorDelete">Delete species</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="group-label">Water temperature</div>
+      <div class="group">
+        <div class="row row-stack">
+          <div class="segmented" id="waterSeg" role="radiogroup" aria-label="Water temperature">
+            <button role="radio" data-water="cold"   aria-checked="false">Cold</button>
+            <button role="radio" data-water="normal" aria-checked="true">Normal</button>
+            <button role="radio" data-water="warm"   aria-checked="false">Warm</button>
+          </div>
+        </div>
+      </div>
+      <div class="row-note" id="waterNote"></div>
+
+      <div class="group-label">Season</div>
+      <div class="group">
+        <div class="row row-stack">
+          <div class="segmented" id="seasonSeg" role="radiogroup" aria-label="Season">
+            <button role="radio" data-season="spring" aria-checked="false">Spring</button>
+            <button role="radio" data-season="summer" aria-checked="true">Summer</button>
+            <button role="radio" data-season="fall"   aria-checked="false">Fall</button>
+          </div>
+        </div>
+      </div>
+      <div class="row-note" id="targetNote"></div>
+
+      <div class="group">
+        <div class="row btn-row">
+          <button class="row-btn plain" id="resetSpecies">Reset species to defaults</button>
         </div>
       </div>
     </div>

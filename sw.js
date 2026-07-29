@@ -16,7 +16,7 @@
  *
  * Bump CACHE_VERSION whenever a shell file changes. */
 
-const CACHE_VERSION = 'v4';
+const CACHE_VERSION = 'v5';
 const CACHE_NAME = 'speedo-' + CACHE_VERSION;
 
 const NET_TIMEOUT_MS = 2000;

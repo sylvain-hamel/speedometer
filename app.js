@@ -39,6 +39,48 @@ const ACC_FAIR = 30;
  * only 63% of a step in one tau, and ~95% in three. SETTLE_FACTOR is that 3x. */
 const SETTLE_FACTOR = 3;
 
+/* --- trolling target ------------------------------------------------------
+ *
+ * Species ranges are stored in m/s, not MPH. Everything else in the filter is
+ * already m/s, and — more to the point — a unit-agnostic store is the only way
+ * switching MPH -> knots can't quietly rewrite a range you spent a season
+ * tuning. (settings.simSpeed does store a display-unit value, and needs the
+ * conversion dance in changeUnit() to stay honest; this avoids that entirely.)
+ *
+ * The defaults below are written in MPH purely because that's the unit anyone
+ * would quote them in. They are a starting guess, not doctrine — every one is
+ * editable, and the list is add/remove as well.
+ */
+const DEFAULT_SPECIES = [
+  ['Brook trout / omble',         0.5, 1.3],
+  ['Rainbow trout / arc-en-ciel', 0.8, 1.8],
+  ['Largemouth bass / achigan',   1.0, 2.0],
+  ['Musky, small / maskinongé',   2.0, 3.5],
+];
+
+const fromMph = (mph) => mph / UNITS.mph.perMs;
+
+function defaultSpecies() {
+  return DEFAULT_SPECIES.map(([name, min, max], i) => ({
+    id: 'd' + i, name, min: fromMph(min), max: fromMph(max),
+  }));
+}
+
+/* Water temperature is the real physical lever — cold water slows fish
+ * metabolism, so you troll slower for the same fish. Season is deliberately a
+ * gentle trim rather than a second strong multiplier: the two are correlated
+ * (cold water largely *is* spring and late fall), and stacking two big factors
+ * would produce nonsense like -40% for a cold spring. As tuned, the extremes
+ * are -29% and +21%, which are defensible. */
+const WATER_FACTORS  = { cold: 0.75, normal: 1, warm: 1.15 };
+const SEASON_FACTORS = { spring: 0.95, summer: 1, fall: 1.05 };
+
+const WATER_WORDS = { cold: 'Cold', normal: 'Normal', warm: 'Warm' };
+
+const AMBER_FRACTION = 0.25;    // amber band, as a fraction of the range width
+const AMBER_FLOOR = fromMph(0.1);  // ...but never so tight it's unusable
+const ZONE_HYST = 0.02;         // m/s (~0.04 MPH) of stickiness on a colour change
+
 const DEFAULTS = {
   unit: 'mph',
   tau: 1,                       // smoothing time constant, seconds (~3 s to settle)
@@ -47,6 +89,12 @@ const DEFAULTS = {
   scenario: 'manual',
   simSpeed: 1.3,                // in whatever unit was active when set
   launched: false,              // has the start screen been through once?
+  targetOn: false,              // trolling target is opt-in
+  species: null,                // seeded from defaultSpecies() on first load
+  speciesId: 'd0',
+  speciesSeq: 0,                // counter behind generated ids
+  water: 'normal',
+  season: 'summer',
 };
 
 const SCENARIO_NOTES = {
@@ -90,6 +138,27 @@ const el = {
   simSpeedSlider: $('simSpeedSlider'),
   simSpeedValue: $('simSpeedValue'),
   simSpeedMax: $('simSpeedMax'),
+  targetLine:   $('targetLine'),
+  targetToggle: $('targetToggle'),
+  targetOptions: $('targetOptions'),
+  speciesList:  $('speciesList'),
+  addSpeciesBtn: $('addSpeciesBtn'),
+  speciesEditor: $('speciesEditor'),
+  editorTitle:  $('editorTitle'),
+  speciesName:  $('speciesName'),
+  minSlider:    $('minSlider'),
+  maxSlider:    $('maxSlider'),
+  minValue:     $('minValue'),
+  maxValue:     $('maxValue'),
+  editorCancel: $('editorCancel'),
+  editorSave:   $('editorSave'),
+  editorDelete: $('editorDelete'),
+  deleteGroup:  $('deleteGroup'),
+  waterSeg:     $('waterSeg'),
+  seasonSeg:    $('seasonSeg'),
+  waterNote:    $('waterNote'),
+  targetNote:   $('targetNote'),
+  resetSpecies: $('resetSpecies'),
 };
 
 /* --- persisted settings -------------------------------------------------- */
@@ -97,12 +166,98 @@ const el = {
 const settings = loadSettings();
 
 function loadSettings() {
+  let s;
   try {
     const raw = localStorage.getItem('speedo.settings');
-    return raw ? Object.assign({}, DEFAULTS, JSON.parse(raw)) : Object.assign({}, DEFAULTS);
+    s = raw ? Object.assign({}, DEFAULTS, JSON.parse(raw)) : Object.assign({}, DEFAULTS);
   } catch (_) {
-    return Object.assign({}, DEFAULTS);
+    s = Object.assign({}, DEFAULTS);
   }
+
+  // An empty *array* is a list the user deliberately emptied and must survive a
+  // relaunch; only a missing one gets seeded. Re-seeding [] would make deleting
+  // the last species impossible.
+  const cleaned = normalizeSpecies(s.species);
+  s.species = cleaned || defaultSpecies();
+
+  if (!s.species.some((x) => x.id === s.speciesId)) {
+    s.speciesId = s.species.length ? s.species[0].id : null;
+  }
+  return s;
+}
+
+/* localStorage is user-writable and survives across versions, so nothing coming
+ * out of it is trusted: a corrupt entry should cost you that one species, not
+ * wedge the whole app on a NaN range. Returns null only for a missing list. */
+function normalizeSpecies(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    const min = Number(s.min);
+    const max = Number(s.max);
+    if (!isFinite(min) || !isFinite(max) || min < 0 || max < 0) continue;
+    const name = typeof s.name === 'string' && s.name.trim()
+      ? s.name.trim().slice(0, 32) : 'Unnamed';
+    out.push({
+      id: typeof s.id === 'string' && s.id ? s.id : 'u' + (out.length + 1),
+      name,
+      min: Math.min(min, max),
+      max: Math.max(min, max),
+    });
+  }
+  return out;
+}
+
+function currentSpecies() {
+  return settings.species.find((s) => s.id === settings.speciesId) || null;
+}
+
+/**
+ * The recommended range right now, in m/s, with the amber margin — or null if
+ * the feature is off or there's no species to aim at.
+ */
+function targetRange() {
+  if (!settings.targetOn) return null;
+  const sp = currentSpecies();
+  if (!sp) return null;
+
+  const f = (WATER_FACTORS[settings.water] || 1) * (SEASON_FACTORS[settings.season] || 1);
+  const min = sp.min * f;
+  const max = sp.max * f;
+  return {
+    min,
+    max,
+    // A margin proportional to the range keeps a wide species forgiving and a
+    // narrow one tight. The floor only bites on a range under ~0.4 MPH wide,
+    // where a proportional margin would leave almost no amber at all.
+    margin: Math.max((max - min) * AMBER_FRACTION, AMBER_FLOOR),
+    species: sp,
+  };
+}
+
+/**
+ * Which colour the number should be: 'in' | 'near' | 'out', or '' for no verdict.
+ *
+ * `prev` is the zone currently displayed, and it matters — without hysteresis a
+ * speed sitting exactly on a boundary flickers between two colours several
+ * times a second, which is far more distracting than being slightly wrong.
+ */
+function zoneOf(ms, range, prev) {
+  if (!range) return '';
+
+  // Below the deadband the display already reads a hard 0.0. You're tied up or
+  // drifting, not trolling badly, so there is no verdict to give — a standstill
+  // glowing red would just be nagging.
+  if (ms < DEADBAND_MS) return '';
+
+  // Leaving a zone takes a slightly bigger move than entering it.
+  const gi = prev === 'in'   ? ZONE_HYST : 0;
+  const gn = prev === 'near' ? ZONE_HYST : 0;
+
+  if (ms >= range.min - gi && ms <= range.max + gi) return 'in';
+  if (ms >= range.min - range.margin - gn && ms <= range.max + range.margin + gn) return 'near';
+  return 'out';
 }
 
 function saveSettings() {
@@ -121,6 +276,7 @@ const state = {
   lastAcc: null,
   error: null,        // human-readable fatal error, or null
   started: false,
+  zone: '',           // displayed target zone: 'in' | 'near' | 'out' | ''
 };
 
 /**
@@ -393,6 +549,9 @@ function render() {
   document.body.classList.toggle('state-stale', !state.error && (lost || state.ema === null));
 
   // --- the big number ---
+  const range = targetRange();
+  let zone = '';
+
   if (state.error) {
     setSpeed('--');
     setText(el.statusLine, 'status', state.error);
@@ -408,6 +567,27 @@ function render() {
     const ms = (stale || state.ema < DEADBAND_MS) ? 0 : state.ema;
     setSpeed((ms * u.perMs).toFixed(1));
     setText(el.statusLine, 'status', stale ? 'STOPPED' : '');
+    // Judged on the value actually displayed, not on state.ema, so the colour
+    // can never disagree with the digits underneath it. Nothing to say while
+    // stopped.
+    if (!stale) zone = zoneOf(ms, range, state.zone);
+  }
+
+  // --- target range + verdict colour ---
+  state.zone = zone;
+  if (shown.zone !== zone) {
+    shown.zone = zone;
+    el.speedValue.classList.remove('zone-in', 'zone-near', 'zone-out');
+    if (zone) el.speedValue.classList.add('zone-' + zone);
+  }
+
+  const targetText = range
+    ? 'TARGET ' + (range.min * u.perMs).toFixed(1) + ' – ' + (range.max * u.perMs).toFixed(1)
+    : '';
+  if (shown.target !== targetText) {
+    shown.target = targetText;
+    el.targetLine.textContent = targetText;
+    el.targetLine.hidden = !targetText;
   }
 
   // --- GPS accuracy + quality dot ---
@@ -514,9 +694,216 @@ function syncSheet() {
   el.simSpeedGroupLabel.classList.toggle('hidden-block', !manual);
   el.scenarioNote.textContent = SCENARIO_NOTES[settings.scenario] || '';
 
+  el.targetToggle.checked = settings.targetOn;
+  el.targetOptions.classList.toggle('hidden-block', !settings.targetOn);
+  setSegmented(el.waterSeg, 'water', settings.water);
+  setSegmented(el.seasonSeg, 'season', settings.season);
+  el.waterNote.textContent =
+    'Cold is roughly below 10 °C / 50 °F, warm above 20 °C / 68 °F. Cold water slows a ' +
+    'fish down, and the speed it will chase drops with it — this is the bigger of the ' +
+    'two adjustments. Season is only a nudge on top.';
+  renderSpeciesList();
+  syncTargetNote();
+
   el.wakeNote.textContent = 'wakeLock' in navigator
     ? 'Holds the screen on while the app is in front.'
     : 'This browser has no wake lock. Set Settings › Display & Brightness › Auto-Lock to Never instead.';
+}
+
+/* --- species list -------------------------------------------------------- */
+
+/* Constant markup only. Every user-supplied string on these rows goes in via
+ * textContent — a species called "<img onerror=...>" has to stay a daft name
+ * rather than becoming script. */
+const TICK_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M2.5 8.4 6 12l7.5-8"></path></svg>';
+
+const PENCIL_SVG =
+  '<svg viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M12.2 2.3a1.6 1.6 0 0 1 2.3 2.3L5.9 13.2l-3.1.8.8-3.1z"></path></svg>';
+
+function renderSpeciesList() {
+  const u = UNITS[settings.unit];
+  el.speciesList.textContent = '';
+
+  if (!settings.species.length) {
+    const empty = document.createElement('div');
+    empty.className = 'species-empty';
+    empty.textContent = 'No species — add one below.';
+    el.speciesList.appendChild(empty);
+    return;
+  }
+
+  for (const sp of settings.species) {
+    const row = document.createElement('div');
+    row.className = 'row species-row';
+    row.dataset.id = sp.id;
+    row.setAttribute('role', 'button');
+
+    const tick = document.createElement('div');
+    tick.className = 'species-tick';
+    tick.dataset.on = String(sp.id === settings.speciesId);
+    tick.innerHTML = TICK_SVG;
+
+    const name = document.createElement('div');
+    name.className = 'species-name';
+    name.textContent = sp.name;
+
+    const rng = document.createElement('div');
+    rng.className = 'species-range';
+    rng.textContent = (sp.min * u.perMs).toFixed(1) + ' – ' +
+                      (sp.max * u.perMs).toFixed(1) + ' ' + u.label;
+
+    const text = document.createElement('div');
+    text.className = 'species-text';
+    text.append(name, rng);
+
+    const edit = document.createElement('button');
+    edit.className = 'species-edit';
+    edit.dataset.edit = sp.id;
+    edit.setAttribute('aria-label', 'Edit ' + sp.name);
+    edit.innerHTML = PENCIL_SVG;
+
+    row.append(tick, text, edit);
+    el.speciesList.appendChild(row);
+  }
+}
+
+function syncTargetNote() {
+  const u = UNITS[settings.unit];
+  const sp = currentSpecies();
+
+  if (!sp) {
+    el.targetNote.textContent = settings.species.length
+      ? 'Pick a species above to set a target.'
+      : 'No species left, so there is nothing to target. Add one, or reset to the defaults below.';
+    return;
+  }
+
+  const f = (WATER_FACTORS[settings.water] || 1) * (SEASON_FACTORS[settings.season] || 1);
+  const lo = (sp.min * f * u.perMs).toFixed(1);
+  const hi = (sp.max * f * u.perMs).toFixed(1);
+  const pct = Math.round((f - 1) * 100);
+  const head = 'Targeting ' + sp.name + ' at ' + lo + '–' + hi + ' ' + u.label + '. ';
+
+  el.targetNote.textContent = pct === 0
+    ? head + 'Normal water in summer, so the base range is used as it stands.'
+    : head + WATER_WORDS[settings.water] + ' water in ' + settings.season +
+      ' shifts the base range by ' + (pct > 0 ? '+' : '') + pct + '%.';
+}
+
+/* --- species editor ------------------------------------------------------ */
+
+let editingId = null;         // null while adding a new one
+
+function openEditor(id) {
+  const u = UNITS[settings.unit];
+  const sp = id ? settings.species.find((s) => s.id === id) : null;
+  editingId = sp ? sp.id : null;
+
+  el.editorTitle.textContent = sp ? 'Edit species' : 'New species';
+  el.speciesName.value = sp ? sp.name : '';
+
+  for (const slider of [el.minSlider, el.maxSlider]) {
+    slider.max = u.sliderMax;
+    slider.step = u.step;
+  }
+  const clamp = (ms) => Math.min(ms * u.perMs, u.sliderMax).toFixed(1);
+  el.minSlider.value = clamp(sp ? sp.min : fromMph(0.8));
+  el.maxSlider.value = clamp(sp ? sp.max : fromMph(1.8));
+  document.querySelectorAll('.editor-cap').forEach((c) => {
+    c.textContent = String(u.sliderMax);
+  });
+
+  el.deleteGroup.classList.toggle('hidden-block', !sp);
+  el.speciesEditor.classList.remove('hidden-block');
+  resetConfirms();
+  syncEditorValues();
+
+  // The editor opens below the fold on a small screen, so bring it into view
+  // rather than leaving it looking like nothing happened.
+  el.speciesEditor.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function closeEditor() {
+  editingId = null;
+  el.speciesEditor.classList.add('hidden-block');
+  resetConfirms();
+}
+
+function syncEditorValues() {
+  const label = UNITS[settings.unit].label;
+  el.minValue.textContent = parseFloat(el.minSlider.value).toFixed(1) + ' ' + label;
+  el.maxValue.textContent = parseFloat(el.maxSlider.value).toFixed(1) + ' ' + label;
+}
+
+function saveEditor() {
+  const u = UNITS[settings.unit];
+  const name = el.speciesName.value.trim().slice(0, 32) || 'Unnamed';
+  const a = parseFloat(el.minSlider.value) / u.perMs;
+  const b = parseFloat(el.maxSlider.value) / u.perMs;
+  const min = Math.min(a, b);
+  const max = Math.max(a, b);
+
+  if (editingId) {
+    const sp = settings.species.find((s) => s.id === editingId);
+    if (sp) { sp.name = name; sp.min = min; sp.max = max; }
+  } else {
+    const id = newSpeciesId();
+    settings.species.push({ id, name, min, max });
+    settings.speciesId = id;      // one you just added is the one you meant to use
+  }
+
+  saveSettings();
+  closeEditor();
+  renderSpeciesList();
+  syncTargetNote();
+}
+
+function newSpeciesId() {
+  let id;
+  do { id = 'u' + (++settings.speciesSeq); }
+  while (settings.species.some((s) => s.id === id));
+  return id;
+}
+
+function deleteEditing() {
+  const i = settings.species.findIndex((s) => s.id === editingId);
+  if (i > -1) settings.species.splice(i, 1);
+  if (!settings.species.some((s) => s.id === settings.speciesId)) {
+    settings.speciesId = settings.species.length ? settings.species[0].id : null;
+  }
+  saveSettings();
+  closeEditor();
+  renderSpeciesList();
+  syncTargetNote();
+}
+
+/* Destructive buttons arm on the first tap and fire on the second.
+ *
+ * A native confirm() blocks the whole page and looks like a browser dialog in
+ * what is meant to pass for an app, and losing a species you spent a season
+ * tuning to one stray tap is worse than an extra tap. Arming resets whenever
+ * anything else happens. */
+const CONFIRMS = new Map();
+
+function armConfirm(btn, prompt, action) {
+  if (CONFIRMS.get(btn)) {
+    resetConfirms();
+    action();
+    return;
+  }
+  resetConfirms();
+  CONFIRMS.set(btn, btn.textContent);
+  btn.textContent = prompt;
+}
+
+function resetConfirms() {
+  for (const [btn, label] of CONFIRMS) btn.textContent = label;
+  CONFIRMS.clear();
 }
 
 function applySource() {
@@ -554,6 +941,10 @@ function changeUnit(next) {
     UNITS[next].sliderMax
   );
   saveSettings();
+  // The editor's sliders are denominated in the old unit and its edits are
+  // unsaved, so there is nothing sensible to carry across — drop it rather than
+  // silently reinterpreting 1.3 knots as 1.3 MPH.
+  closeEditor();
   syncSheet();
 }
 
@@ -594,6 +985,98 @@ el.simToggle.addEventListener('change', () => {
   saveSettings();
   syncSheet();
   applySource();
+});
+
+/* --- trolling target ----------------------------------------------------- */
+
+el.targetToggle.addEventListener('change', () => {
+  settings.targetOn = el.targetToggle.checked;
+  saveSettings();
+  closeEditor();
+  syncSheet();
+  render();                     // don't wait up to 200 ms for the colour to appear
+});
+
+el.waterSeg.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-water]');
+  if (!b) return;
+  settings.water = b.dataset.water;
+  saveSettings();
+  setSegmented(el.waterSeg, 'water', settings.water);
+  syncTargetNote();
+});
+
+el.seasonSeg.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-season]');
+  if (!b) return;
+  settings.season = b.dataset.season;
+  saveSettings();
+  setSegmented(el.seasonSeg, 'season', settings.season);
+  syncTargetNote();
+});
+
+// Delegated: the rows are rebuilt whenever the list changes.
+el.speciesList.addEventListener('click', (e) => {
+  const edit = e.target.closest('[data-edit]');
+  if (edit) { openEditor(edit.dataset.edit); return; }
+
+  const row = e.target.closest('.species-row');
+  if (!row) return;
+  settings.speciesId = row.dataset.id;
+  saveSettings();
+  closeEditor();
+  renderSpeciesList();
+  syncTargetNote();
+});
+
+el.addSpeciesBtn.addEventListener('click', () => openEditor(null));
+
+// Min and max share one range and can't cross: shove the other one along rather
+// than letting you build a backwards range that silently reads as empty.
+el.minSlider.addEventListener('input', () => {
+  if (parseFloat(el.minSlider.value) > parseFloat(el.maxSlider.value)) {
+    el.maxSlider.value = el.minSlider.value;
+  }
+  syncEditorValues();
+});
+
+el.maxSlider.addEventListener('input', () => {
+  if (parseFloat(el.maxSlider.value) < parseFloat(el.minSlider.value)) {
+    el.minSlider.value = el.maxSlider.value;
+  }
+  syncEditorValues();
+});
+
+el.editorSave.addEventListener('click', saveEditor);
+el.editorCancel.addEventListener('click', closeEditor);
+
+el.editorDelete.addEventListener('click', () => {
+  armConfirm(el.editorDelete, 'Tap again to delete', deleteEditing);
+});
+
+el.resetSpecies.addEventListener('click', () => {
+  armConfirm(el.resetSpecies, 'Tap again to reset — this discards your edits', () => {
+    settings.species = defaultSpecies();
+    settings.speciesId = settings.species[0].id;
+    saveSettings();
+    closeEditor();
+    renderSpeciesList();
+    syncTargetNote();
+  });
+});
+
+// iOS slides the keyboard over the bottom half of the screen, which is exactly
+// where a bottom sheet lives — without this the field you're typing in ends up
+// underneath it. The delay lets the keyboard finish animating first.
+el.speciesName.addEventListener('focus', () => {
+  setTimeout(() => el.speciesName.scrollIntoView({ block: 'center', behavior: 'smooth' }), 300);
+});
+
+el.speciesName.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  el.speciesName.blur();
+  saveEditor();
 });
 
 /* --- start --------------------------------------------------------------- */
@@ -658,5 +1141,7 @@ if (typeof window !== 'undefined') {
     state, settings, UNITS, SETTLE_FACTOR,
     pushSample, resetFilter, speedSpread, median, render, syncSheet, applySource,
     start, saveSettings,
+    targetRange, zoneOf, currentSpecies, defaultSpecies, normalizeSpecies,
+    WATER_FACTORS, SEASON_FACTORS, AMBER_FRACTION,
   };
 }

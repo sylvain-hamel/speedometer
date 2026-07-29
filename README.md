@@ -31,7 +31,7 @@ is only needed to install and update.
 | **LIVE** | The unfiltered reading, straight from the GPS. Useful for seeing what the smoothing is doing for you. |
 
 Tap **MPH** under the number to cycle through MPH, knots and km/h. The hamburger opens
-units, smoothing and the simulator.
+units, the trolling target, smoothing and the simulator.
 
 The start screen appears only on the very first launch. After that the app opens straight
 into the readout and starts acquiring a fix immediately.
@@ -45,6 +45,63 @@ into the readout and starts acquiring a fix immediately.
   display flap between a number and a warning while you're tied up.
 - **Below about 0.2 MPH** → pinned to `0.0`, so stationary drift doesn't read as a phantom
   few tenths.
+
+## Trolling target
+
+Off by default. Hamburger → **Speed target**. Pick what you're fishing for and the big
+number starts carrying a verdict, so a glance at the helm tells you whether you're on it
+without reading anything:
+
+```
+                    1.5              green
+                    MPH
+             TARGET 0.8 – 1.8
+```
+
+| Colour | Meaning |
+|---|---|
+| **Green** | Inside the recommended range. |
+| **Amber** | Just outside — nudge the throttle. The amber band is 25% of the range width either side, so a forgiving species stays forgiving and a tight one stays tight. |
+| **Red** | Well outside the range. |
+| **White** | No verdict. Either the target is off, or you're under about 0.2 MPH and not trolling yet — a standstill glowing red would just be nagging. |
+
+A stale or lost fix always wins: the number goes grey and drops the colour entirely,
+rather than leaving a confident green on a reading that's no longer live.
+
+### The species list
+
+Four to start with, all editable, and you can add or remove your own. They're stored on
+your phone with the rest of your settings.
+
+| Species | Base range |
+|---|---|
+| Brook trout / omble | 0.5 – 1.3 MPH |
+| Rainbow trout / arc-en-ciel | 0.8 – 1.8 MPH |
+| Largemouth bass / achigan | 1.0 – 2.0 MPH |
+| Musky, small / maskinongé | 2.0 – 3.5 MPH |
+
+These are an opening guess, not doctrine — tap the pencil on any row to change the name or
+drag its range, **Add a species** for anything not listed, and **Reset species to defaults**
+to start over. Delete and reset both take two taps, because losing a range you spent a
+season tuning to one stray tap on a wet screen would be miserable.
+
+Ranges are stored internally in m/s rather than MPH, so switching between MPH, knots and
+km/h converts the display without ever rewriting what you saved.
+
+### Water temperature and season
+
+The base range is multiplied by two factors:
+
+| Water | | Season | |
+|---|---|---|---|
+| Cold (below ~10 °C / 50 °F) | ×0.75 | Spring | ×0.95 |
+| Normal | ×1.00 | Summer | ×1.00 |
+| Warm (above ~20 °C / 68 °F) | ×1.15 | Fall | ×1.05 |
+
+Water temperature is the real lever — cold water slows a fish's metabolism and the speed it
+will chase drops with it. Season is deliberately only a trim: the two are correlated (cold
+water largely *is* spring and late fall), and stacking two strong multipliers would produce
+nonsense like −40% for a cold spring. As tuned, the extremes are −29% and +21%.
 
 ## Install on iPhone
 
@@ -120,8 +177,9 @@ no accounts, no cookies, and no third-party requests.
   sends no telemetry, no beacons, no error reports.
 - **Zero third-party requests.** No analytics, no external CDN, no web fonts, no remote
   images, no third-party scripts. Everything it needs ships in this repository.
-- **The only thing saved** is your own settings — units, smoothing, simulator — in
-  `localStorage` on your phone. Nothing else touches storage, and no cookies are set.
+- **The only thing saved** is your own settings — units, smoothing, simulator, and your
+  species list — in `localStorage` on your phone. Nothing else touches storage, and no
+  cookies are set.
 
 To be precise rather than flattering: on launch, when online, the app does re-request its
 own files (the page and its script) from wherever you installed it from, to pick up updates.
@@ -152,14 +210,15 @@ npx http-server -p 8000     # or: python3 -m http.server 8000
 Plain HTML, CSS and JavaScript. No build, no dependencies, no framework.
 
 ```bash
-node tools/verify.mjs       # 34 end-to-end checks + layout screenshots
+node tools/verify.mjs       # 64 end-to-end checks + layout screenshots
 node tools/make-icons.mjs   # regenerate PNGs after editing icons/icon.svg
 ```
 
 `tools/` needs Playwright and Chromium; the app itself needs neither. `verify.mjs` drives
 the real page — the filter assertions call into the live app rather than a copy — and
 covers spike rejection, the deadband, step response, unit conversion, every degraded state,
-service-worker precaching, offline boot, and layout across four iPhone viewports.
+the target colour thresholds and species list, service-worker precaching, offline boot, and
+layout across four iPhone viewports.
 
 After changing any shipped file, bump `CACHE_VERSION` in `sw.js`. The service worker is
 network-first for code and cache-first for icons, so an online launch picks changes up
