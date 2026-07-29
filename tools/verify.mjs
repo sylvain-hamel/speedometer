@@ -66,6 +66,18 @@ const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok: !!ok, detail });
 const near = (v, target, tol) => Number.isFinite(v) && Math.abs(v - target) <= tol;
 
+/* Set a range input and fire its handler.
+ *
+ * Not page.fill(): it validates the value against the input's step, and with
+ * step="0.1" the float arithmetic makes perfectly ordinary values like 3.0
+ * ("Malformed value") fail. Assigning directly sidesteps a harness quirk that
+ * has nothing to do with the app. */
+const setRange = (page, sel, v) => page.evaluate(([s, val]) => {
+  const node = document.querySelector(s);
+  node.value = String(val);
+  node.dispatchEvent(new Event('input', { bubbles: true }));
+}, [sel, v]);
+
 const MPH = 2.2369362920544;
 const mphToMs = (m) => m / MPH;
 
@@ -359,6 +371,363 @@ async function newPage(over = {}) {
   }, mphToMs(1.3));
   check('fix dot: accuracy jittering across a threshold does not blink the dot',
     flicker.changes === 0, JSON.stringify(flicker));
+
+  await ctx.close();
+}
+
+/* ==========================================================================
+   2b. Trolling target — the range maths and the verdict colour
+   ========================================================================== */
+{
+  const { ctx, page } = await newPage({ targetOn: true, speciesId: 'd0' });
+
+  // Brook trout ships as 0.5 - 1.3 MPH. Normal water in summer leaves it alone,
+  // so the amber margin is (1.3 - 0.5) x 25% = 0.2 either side.
+  const zoneAt = (mph) => page.evaluate((v) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    S.state.zone = '';                       // clear hysteresis between probes
+    S.settings.tau = 0.5;
+    const now = Date.now(), N = 30;
+    for (let i = 0; i < N; i++) S.pushSample(v, 5, now - (N - 1 - i) * 1000);
+    S.render();
+    const node = document.getElementById('speedValue');
+    return {
+      text: node.textContent,
+      zone: (node.className.match(/zone-(\w+)/) || ['', ''])[1],
+      target: document.getElementById('targetLine').textContent,
+    };
+  }, mphToMs(mph));
+
+  const mid = await zoneAt(0.9);
+  const lowEdge = await zoneAt(0.4);         // 0.1 under -> amber
+  const highEdge = await zoneAt(1.45);       // 0.15 over -> amber
+  const tooFast = await zoneAt(2.2);
+  const tooSlow = await zoneAt(0.25);        // above the deadband, below the amber band
+  const onEdge = await zoneAt(0.3);          // exactly amber's outer edge, which is inclusive
+
+  check('target: inside the range turns the number green',
+    mid.zone === 'in', JSON.stringify(mid));
+  check('target: just outside either edge turns it amber',
+    lowEdge.zone === 'near' && highEdge.zone === 'near',
+    JSON.stringify({ lowEdge, highEdge }));
+  check('target: well outside either edge turns it red',
+    tooFast.zone === 'out' && tooSlow.zone === 'out',
+    JSON.stringify({ tooFast, tooSlow }));
+  check('target: the amber band is 25% of the range width, and its edge counts as amber',
+    onEdge.zone === 'near', JSON.stringify(onEdge));
+  check('target: the range is shown under the number, so the colour is explained',
+    mid.target === 'TARGET 0.5 – 1.3', `showed "${mid.target}"`);
+
+  // Sitting at the dock must not read as "trolling badly". Below the deadband
+  // the app already shows a hard 0.0, and there is no verdict to give.
+  const stopped = await zoneAt(0.1);
+  check('target: a standstill gets no colour rather than an angry red 0.0',
+    stopped.zone === '' && stopped.text === '0.0', JSON.stringify(stopped));
+
+  // Hysteresis: parked exactly on a boundary, the colour must hold rather than
+  // flickering between two every render tick.
+  const boundary = await page.evaluate((v) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    S.state.zone = '';
+    S.settings.tau = 0.5;
+    const now = Date.now(), N = 30;
+    for (let i = 0; i < N; i++) S.pushSample(v, 5, now - (N - 1 - i) * 1000);
+    const seen = [];
+    for (let i = 0; i < 12; i++) { S.render(); seen.push(S.state.zone); }
+    return seen;
+  }, mphToMs(1.3));                          // exactly the top of the range
+  check('target: a speed parked on a boundary holds one colour, never strobes',
+    new Set(boundary).size === 1, JSON.stringify(boundary));
+
+  // Modifiers. Water is the strong lever, season a trim; the point of the check
+  // is that they compose without producing something silly at the extremes.
+  const ranges = await page.evaluate(() => {
+    const S = window.__speedo;
+    const MPH = S.UNITS.mph.perMs;
+    const out = {};
+    for (const [w, s] of [['normal', 'summer'], ['cold', 'summer'], ['warm', 'summer'],
+                          ['cold', 'spring'], ['warm', 'fall']]) {
+      S.settings.water = w;
+      S.settings.season = s;
+      const r = S.targetRange();
+      out[w + '/' + s] = [+(r.min * MPH).toFixed(3), +(r.max * MPH).toFixed(3)];
+    }
+    S.settings.water = 'normal';
+    S.settings.season = 'summer';
+    return out;
+  });
+  const rangeOk = (key, lo, hi) => {
+    const r = ranges[key];
+    return r && near(r[0], lo, 0.01) && near(r[1], hi, 0.01);
+  };
+  check('target: water temperature shifts the range (cold slower, warm faster)',
+    rangeOk('normal/summer', 0.5, 1.3) && rangeOk('cold/summer', 0.375, 0.975)
+      && rangeOk('warm/summer', 0.575, 1.495), JSON.stringify(ranges));
+  check('target: season trims on top, and the extremes stay sane (-29% / +21%)',
+    rangeOk('cold/spring', 0.356, 0.926) && rangeOk('warm/fall', 0.604, 1.570),
+    JSON.stringify(ranges));
+
+  // Units: the stored range is m/s, so converting is display-only.
+  const converted = await page.evaluate(() => {
+    const S = window.__speedo;
+    const before = S.currentSpecies().min;
+    S.settings.unit = 'kn';
+    S.render();
+    const knots = document.getElementById('targetLine').textContent;
+    S.settings.unit = 'kmh';
+    S.render();
+    const kmh = document.getElementById('targetLine').textContent;
+    S.settings.unit = 'mph';
+    S.render();
+    return { knots, kmh, drifted: S.currentSpecies().min !== before };
+  });
+  check('target: the range follows the unit and the stored value never drifts',
+    converted.knots === 'TARGET 0.4 – 1.1' && converted.kmh === 'TARGET 0.8 – 2.1'
+      && !converted.drifted, JSON.stringify(converted));
+
+  // The one bug this feature could plausibly introduce that would matter on the
+  // water: a stale or unknown reading wearing a confident green.
+  const degraded = await page.evaluate((v) => {
+    const S = window.__speedo;
+    const node = document.getElementById('speedValue');
+    const out = {};
+
+    S.resetFilter();
+    S.state.zone = '';
+    const now = Date.now();
+    for (let i = 0; i < 20; i++) S.pushSample(v, 5, now - (19 - i) * 1000);
+    S.render();
+    out.live = node.className;
+
+    S.state.lastContactAt = now - 20000;     // under way, then the fix drops
+    S.render();
+    out.lost = node.className;
+    out.lostColor = getComputedStyle(node).color;
+
+    S.resetFilter();
+    S.state.error = 'LOCATION ACCESS DENIED';
+    S.render();
+    out.error = node.className;
+    S.state.error = null;
+    return out;
+  }, mphToMs(0.9));
+  check('target: a lost fix or an error drops the colour — never a confident green on stale data',
+    degraded.live.includes('zone-in') && !/zone-/.test(degraded.lost)
+      && !/zone-/.test(degraded.error), JSON.stringify(degraded));
+
+  // ...and the stylesheet says the same thing independently, so a future change
+  // to the render path can't quietly resurrect a coloured stale number.
+  const cssGuard = await page.evaluate(() => {
+    // A throwaway probe rather than the real readout: the live number carries a
+    // 260 ms colour transition, so getComputedStyle on it mid-flight returns an
+    // interpolated value and the assertion would be measuring the animation.
+    const probe = document.createElement('div');
+    probe.className = 'speed-value zone-in';
+    probe.style.cssText = 'transition:none;position:absolute;visibility:hidden';
+    document.body.appendChild(probe);
+
+    const had = [...document.body.classList].filter((c) => c.startsWith('state-'));
+    document.body.classList.remove('state-stale', 'state-error');
+    const live = getComputedStyle(probe).color;
+    document.body.classList.add('state-stale');
+    const stale = getComputedStyle(probe).color;
+    document.body.classList.add('state-error');
+    const errored = getComputedStyle(probe).color;
+
+    document.body.classList.remove('state-stale', 'state-error');
+    for (const c of had) document.body.classList.add(c);
+    probe.remove();
+    return { live, stale, errored };
+  });
+  check('target: the grey "we do not know" style outranks the verdict colour in CSS too',
+    cssGuard.live === 'rgb(48, 209, 88)'
+      && cssGuard.stale === 'rgba(235, 235, 245, 0.3)'
+      && cssGuard.errored === 'rgba(235, 235, 245, 0.3)',
+    JSON.stringify(cssGuard));
+
+  await ctx.close();
+}
+
+/* Off by default: the feature must be entirely invisible until asked for. */
+{
+  const { ctx, page } = await newPage();
+  const off = await page.evaluate((v) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    const now = Date.now();
+    for (let i = 0; i < 20; i++) S.pushSample(v, 5, now - (19 - i) * 1000);
+    S.render();
+    return {
+      on: S.settings.targetOn,
+      cls: document.getElementById('speedValue').className,
+      hidden: document.getElementById('targetLine').hidden,
+      range: S.targetRange(),
+    };
+  }, mphToMs(0.9));
+  check('target: off by default — no colour, no target line, no range at all',
+    off.on === false && !/zone-/.test(off.cls) && off.hidden === true
+      && off.range === null, JSON.stringify(off));
+  await ctx.close();
+}
+
+/* ==========================================================================
+   2c. Species list — add, edit, delete, reset, and survive a relaunch
+   ========================================================================== */
+{
+  // No addInitScript: it re-runs on every navigation, so a seeded context would
+  // overwrite localStorage on reload and the persistence half would be vacuous.
+  const ctx = await browser.newContext({ viewport: { width: 393, height: 852 } });
+  const page = await ctx.newPage();
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+
+  await page.click('#startBtn');
+  await page.click('#menuBtn');
+  await page.waitForTimeout(400);
+  await page.click('#targetToggle');
+  await page.waitForTimeout(200);
+
+  const readList = () => page.evaluate(() =>
+    [...document.querySelectorAll('#speciesList .species-row')].map((r) => ({
+      name: r.querySelector('.species-name').textContent,
+      range: r.querySelector('.species-range').textContent,
+      on: r.querySelector('.species-tick').dataset.on === 'true',
+    })));
+
+  const seeded = await readList();
+  check('species: the four discussed defaults are seeded on first run',
+    seeded.length === 4 && seeded[0].name === 'Brook trout / omble'
+      && seeded[0].range === '0.5 – 1.3 MPH' && seeded[3].range === '2.0 – 3.5 MPH',
+    JSON.stringify(seeded));
+
+  // --- add ---
+  await page.click('#addSpeciesBtn');
+  await page.fill('#speciesName', 'Walleye / doré');
+  await setRange(page, '#minSlider', 0.8);
+  await setRange(page, '#maxSlider', 1.8);
+  await page.click('#editorSave');
+  await page.waitForTimeout(200);
+
+  const added = await readList();
+  check('species: adding one appends it and selects it, since that is why you added it',
+    added.length === 5 && added[4].name === 'Walleye / doré'
+      && added[4].range === '0.8 – 1.8 MPH' && added[4].on === true
+      && added.filter((s) => s.on).length === 1, JSON.stringify(added));
+
+  // --- edit an existing one ---
+  await page.click('#speciesList .species-row:nth-child(1) .species-edit');
+  await page.fill('#speciesName', 'Brookies');
+  await setRange(page, '#maxSlider', 1.6);
+  await page.click('#editorSave');
+  await page.waitForTimeout(200);
+
+  const edited = await readList();
+  check('species: editing rewrites name and range without touching what is selected',
+    edited[0].name === 'Brookies' && edited[0].range === '0.5 – 1.6 MPH'
+      && edited[4].on === true, JSON.stringify(edited));
+
+  // --- a backwards range is impossible: the sliders shove each other along ---
+  await page.click('#speciesList .species-row:nth-child(1) .species-edit');
+  await setRange(page, '#minSlider', 3.0);
+  const shoved = await page.evaluate(() => ({
+    min: document.getElementById('minSlider').value,
+    max: document.getElementById('maxSlider').value,
+  }));
+  check('species: dragging the minimum past the maximum pushes it along, never inverts',
+    parseFloat(shoved.min) <= parseFloat(shoved.max), JSON.stringify(shoved));
+  await page.click('#editorCancel');
+  await page.waitForTimeout(150);
+  const cancelled = await readList();
+  check('species: Cancel discards the edit rather than half-applying it',
+    cancelled[0].range === '0.5 – 1.6 MPH', JSON.stringify(cancelled[0]));
+
+  // --- delete, which takes two taps on purpose ---
+  await page.click('#speciesList .species-row:nth-child(2) .species-edit');
+  await page.click('#editorDelete');
+  await page.waitForTimeout(150);
+  const armed = await readList();
+  const armedLabel = await page.textContent('#editorDelete');
+  check('species: one tap on Delete only arms it — a stray tap cannot destroy a tuned range',
+    armed.length === 5 && /again/i.test(armedLabel), `${armed.length} rows, "${armedLabel}"`);
+
+  await page.click('#editorDelete');
+  await page.waitForTimeout(200);
+  const deleted = await readList();
+  check('species: the second tap deletes',
+    deleted.length === 4 && !deleted.some((s) => /Rainbow/.test(s.name)),
+    JSON.stringify(deleted));
+
+  // --- persistence ---
+  await page.click('#doneBtn');
+  await page.waitForTimeout(200);
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  await page.click('#menuBtn');
+  await page.waitForTimeout(400);
+
+  const survived = await readList();
+  const stillOn = await page.evaluate(() => window.__speedo.settings.targetOn);
+  check('species: the whole edited list survives a relaunch',
+    stillOn === true && survived.length === 4 && survived[0].name === 'Brookies'
+      && survived[3].name === 'Walleye / doré' && survived[3].on === true,
+    JSON.stringify(survived));
+
+  // --- delete everything: degrade quietly, do not wedge ---
+  const emptied = await page.evaluate(() => {
+    const S = window.__speedo;
+    S.settings.species = [];
+    S.settings.speciesId = null;
+    S.saveSettings();
+    S.syncSheet();
+    S.render();
+    return {
+      range: S.targetRange(),
+      hidden: document.getElementById('targetLine').hidden,
+      cls: document.getElementById('speedValue').className,
+      note: document.getElementById('targetNote').textContent,
+    };
+  });
+  check('species: an empty list degrades to no target instead of breaking the readout',
+    emptied.range === null && emptied.hidden === true && !/zone-/.test(emptied.cls)
+      && /add one/i.test(emptied.note), JSON.stringify(emptied));
+
+  // An emptied list is a deliberate act and must survive a relaunch — re-seeding
+  // it would make deleting the last species impossible.
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  const stillEmpty = await page.evaluate(() => window.__speedo.settings.species.length);
+  check('species: an emptied list stays empty across a relaunch, not silently re-seeded',
+    stillEmpty === 0, `${stillEmpty} species`);
+
+  // --- reset, also two taps ---
+  await page.click('#menuBtn');
+  await page.waitForTimeout(400);
+  await page.click('#resetSpecies');
+  await page.waitForTimeout(150);
+  const resetArmed = await readList();
+  await page.click('#resetSpecies');
+  await page.waitForTimeout(200);
+  const reset = await readList();
+  check('species: Reset restores the four defaults, and also takes two taps',
+    resetArmed.length === 0 && reset.length === 4
+      && reset[0].name === 'Brook trout / omble' && reset[0].on === true,
+    JSON.stringify(reset));
+
+  // A species name is user text and gets rendered into a list — it must stay text.
+  await page.click('#addSpeciesBtn');
+  await page.fill('#speciesName', '<img src=x onerror="window.__pwned=1">');
+  await page.click('#editorSave');
+  await page.waitForTimeout(300);
+  const escaped = await page.evaluate(() => ({
+    pwned: !!window.__pwned,
+    imgs: document.querySelectorAll('#speciesList img').length,
+    text: document.querySelector('#speciesList .species-row:last-child .species-name').textContent,
+  }));
+  check('species: a name containing markup stays a daft name, not script',
+    !escaped.pwned && escaped.imgs === 0 && escaped.text.startsWith('<img'),
+    JSON.stringify(escaped));
 
   await ctx.close();
 }
@@ -743,6 +1112,29 @@ async function newPage(over = {}) {
   await page.fill('#simSpeedSlider', '4.2');
   await page.dispatchEvent('#simSpeedSlider', 'input');
   await page.click('#wakeToggle');
+
+  // ...including the whole trolling-target group, editor and all.
+  await page.click('#targetToggle');
+  await page.waitForTimeout(200);
+  for (const w of ['cold', 'warm', 'normal']) await page.click(`[data-water="${w}"]`);
+  for (const s of ['spring', 'fall', 'summer']) await page.click(`[data-season="${s}"]`);
+  await page.click('#speciesList .species-row:nth-child(3)');
+  await page.click('#speciesList .species-row:nth-child(2) .species-edit');
+  await page.fill('#speciesName', 'Test');
+  await setRange(page, '#minSlider', 1.1);
+  await page.click('#editorSave');
+  await page.click('#addSpeciesBtn');
+  await page.click('#editorCancel');
+  // A unit change while the editor is open is the awkward case: the sliders are
+  // denominated in the old unit, so the editor has to bow out.
+  await page.click('#speciesList .species-row:nth-child(1) .species-edit');
+  await page.click('[data-unit="kn"]');
+  const editorGone = await page.evaluate(() =>
+    document.getElementById('speciesEditor').classList.contains('hidden-block'));
+  check('changing units closes the species editor rather than reinterpreting its sliders',
+    editorGone === true, `hidden=${editorGone}`);
+  await page.click('[data-unit="mph"]');
+
   await page.click('#doneBtn');
   await page.waitForTimeout(1500);
 
@@ -825,7 +1217,12 @@ for (const [name, w, h] of DEVICES) {
     viewport: { width: w, height: h },
     deviceScaleFactor: 2,
   });
-  await ctx.addInitScript(seed({ sim: true, scenario: 'chop' }));
+  // Target on, aimed at rainbow trout (0.8 - 1.8): the chop scenario holds 1.3,
+  // so the shots show a green number with the extra target line in place — the
+  // tallest the readout ever gets, which is the case worth measuring.
+  await ctx.addInitScript(seed({
+    sim: true, scenario: 'chop', targetOn: true, speciesId: 'd1',
+  }));
   const page = await ctx.newPage();
   await page.goto(BASE, { waitUntil: 'load' });
   await page.waitForFunction(() => !!window.__speedo);
@@ -839,20 +1236,25 @@ for (const [name, w, h] of DEVICES) {
     const v = el.getBoundingClientRect();
     const m = document.querySelector('.metrics').getBoundingClientRect();
     const r = document.querySelector('.readout').getBoundingClientRect();
+    const t = document.getElementById('targetLine').getBoundingClientRect();
     return {
       overflowX: document.documentElement.scrollWidth > window.innerWidth + 1,
       numberInside: v.left >= -1 && v.right <= window.innerWidth + 1,
       metricsInside: m.bottom <= window.innerHeight + 1,
       clearsMetrics: r.bottom <= m.top + 1,
+      targetInside: t.left >= -1 && t.right <= window.innerWidth + 1 && t.height > 0,
       // Guard against the whole check passing vacuously against a "--" placeholder.
       text: el.textContent,
       isNumber: /^\d+\.\d$/.test(el.textContent),
+      coloured: /zone-/.test(el.className),
       height: v.height,
     };
   });
   check(`layout ${name}: a real number renders, fits, and nothing overflows`,
     fits.isNumber && !fits.overflowX && fits.numberInside
       && fits.metricsInside && fits.clearsMetrics, JSON.stringify(fits));
+  check(`layout ${name}: the target line fits and the number carries its verdict`,
+    fits.targetInside && fits.coloured, JSON.stringify(fits));
 
   if (name === 'iphone-15') {
     await page.click('#menuBtn');
