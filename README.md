@@ -94,6 +94,10 @@ time-aware — its coefficient is derived from the actual gap between fixes — 
 arrive at irregular intervals, and a plain N-sample average would silently change its own
 time constant whenever the fix rate dropped.
 
+The filter waits for a few fixes before it starts, rather than seeding itself from the first
+one. A cold GPS start often produces one wildly wrong reading, and seeding from it drags the
+display off for several seconds before the average can haul it back.
+
 Staleness is judged on when a fix *arrived*, not on the timestamp it carries. iOS can hand
 back a position stamped noticeably earlier than the moment it is delivered, and keying off
 that makes a perfectly good fix look expired on arrival.
@@ -110,13 +114,20 @@ it is a measurement, not a manufacturer's figure.
 no accounts, no cookies, and no third-party requests.
 
 - **Your position never leaves the device.** It is read from the browser's geolocation API,
-  turned into a number on screen, and discarded. It is never stored, logged or transmitted.
-- **Nothing is sent anywhere, ever.** Once installed the app makes no network requests at
-  all — not even to the server it came from.
-- **No external resources.** No CDN, no web fonts, no remote images, no third-party scripts.
-  Everything it needs ships in this repository.
+  turned into a number on screen, and discarded. It is never stored, logged or transmitted —
+  not to me, not to anyone.
+- **Nothing is ever uploaded.** No request the app makes carries any data about you. It
+  sends no telemetry, no beacons, no error reports.
+- **Zero third-party requests.** No analytics, no external CDN, no web fonts, no remote
+  images, no third-party scripts. Everything it needs ships in this repository.
 - **The only thing saved** is your own settings — units, smoothing, simulator — in
   `localStorage` on your phone. Nothing else touches storage, and no cookies are set.
+
+To be precise rather than flattering: on launch, when online, the app does re-request its
+own files (the page and its script) from wherever you installed it from, to pick up updates.
+That's an ordinary file download that sends nothing but the request itself, and it's the
+same server that served you the app in the first place. Offline it makes no requests at all
+and runs entirely from cache.
 
 It's a handful of static files with no server-side component, so you can read the whole
 thing in a few minutes. These aren't just promises either: `tools/verify.mjs` asserts that
@@ -141,7 +152,7 @@ npx http-server -p 8000     # or: python3 -m http.server 8000
 Plain HTML, CSS and JavaScript. No build, no dependencies, no framework.
 
 ```bash
-node tools/verify.mjs       # 32 end-to-end checks + layout screenshots
+node tools/verify.mjs       # 34 end-to-end checks + layout screenshots
 node tools/make-icons.mjs   # regenerate PNGs after editing icons/icon.svg
 ```
 
@@ -150,8 +161,10 @@ the real page — the filter assertions call into the live app rather than a cop
 covers spike rejection, the deadband, step response, unit conversion, every degraded state,
 service-worker precaching, offline boot, and layout across four iPhone viewports.
 
-After changing any shipped file, bump `CACHE_VERSION` in `sw.js` so installed copies pick up
-the update on their next launch.
+After changing any shipped file, bump `CACHE_VERSION` in `sw.js`. The service worker is
+network-first for code and cache-first for icons, so an online launch picks changes up
+immediately; a pure cache-first worker served the previous version on every launch, which
+made every change land one launch late.
 
 ## Licence
 

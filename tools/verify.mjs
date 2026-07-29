@@ -36,9 +36,12 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
+const served = [];                 // request log, for the update-freshness check
+
 const server = createServer(async (req, res) => {
   try {
     let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+    served.push(p);
     if (p.endsWith('/')) p += 'index.html';
     const file = resolve(root, '.' + p);
     if (!file.startsWith(root)) { res.writeHead(403).end(); return; }
@@ -114,6 +117,23 @@ async function newPage(over = {}) {
   }, mphToMs(1.3));
   check('spike rejected: 8 m/s glitch never reaches display',
     near(parseFloat(spike), 1.3, 0.06), `showed ${spike}`);
+
+  // --- cold start: a garbage first fix must not reach the display ---
+  const cold = await page.evaluate((v13) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    S.settings.tau = 3;
+    const now = Date.now();
+    S.pushSample(8, 40, now - 6000);          // nonsense first fix, as GPS does
+    S.render();
+    const afterFirst = document.getElementById('speedValue').textContent;
+    for (let i = 1; i < 7; i++) S.pushSample(v13, 5, now - 6000 + i * 1000);
+    S.render();
+    return { afterFirst, settled: document.getElementById('speedValue').textContent };
+  }, mphToMs(1.3));
+  check('cold start: a junk first fix never reaches the display',
+    cold.afterFirst === '--' && near(parseFloat(cold.settled), 1.3, 0.15),
+    JSON.stringify(cold));
 
   // --- deadband ---
   const dead = await page.evaluate(() => {
@@ -458,6 +478,18 @@ async function newPage(over = {}) {
   check('service worker precached the whole shell',
     cached && wanted.every((w) => cached.some((p) => p.endsWith(w))),
     JSON.stringify(cached));
+
+  // With a service worker installed and the network up, a reload must still go
+  // out for the code. Pure cache-first served the previous version on every
+  // launch, so a change was always one launch late — that regression is what
+  // this check exists to catch.
+  served.length = 0;
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  const refetched = served.some((p) => p.endsWith('app.js'))
+                 && served.some((p) => p.endsWith('/') || p.endsWith('index.html'));
+  check('update freshness: a reload re-fetches the code, so changes land at once',
+    refetched, JSON.stringify(served));
 
   await ctx.setOffline(true);
   await page.reload({ waitUntil: 'load' });

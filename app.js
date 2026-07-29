@@ -21,6 +21,7 @@ const UNITS = {
 };
 
 const MEDIAN_WINDOW   = 5;      // samples; rejects single-fix GPS spikes
+const MIN_SEED_SAMPLES = 3;     // fixes required before the filter starts
 const SPREAD_WINDOW_MS = 10000; // window used for the ± figure
 const SAMPLE_KEEP_MS  = 20000;  // ring buffer retention
 const DEADBAND_MS     = 0.089;  // ~0.2 MPH. Below this, show a hard 0.0
@@ -148,6 +149,12 @@ function pushSample(speedMs, accuracy, when) {
   const med = median(recent);
 
   if (state.ema === null) {
+    // Don't seed the filter from a single fix. The first reading after a cold
+    // start is frequently garbage, and seeding from it drags the display off
+    // for several seconds before the average can pull it back. Waiting for
+    // enough samples to make the median meaningful costs a second or two of
+    // "WAITING FOR FIX" and removes the whole failure mode.
+    if (state.samples.length < MIN_SEED_SAMPLES) return;
     state.ema = med;
   } else {
     const dt = Math.max(0, (t - state.emaAt) / 1000);

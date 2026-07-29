@@ -1,12 +1,25 @@
-/* Service worker: cache-first, so launching never waits on a marine cell signal.
+/* Service worker.
  *
- * The app needs no network at all once installed — GPS is on-device — so the
- * whole shell is precached and served from cache. Bump CACHE_VERSION whenever a
- * file below changes; the new worker installs in the background and takes over
- * on the next cold launch. */
+ * The app needs no network once installed — GPS is on-device — so the whole
+ * shell is precached and the app works fully offline.
+ *
+ * Strategy is split, because pure cache-first got this wrong in a way that
+ * matters: it served the previous version on every launch and only fetched the
+ * update in the background, so a change was always one launch late with no
+ * indication anything was stale.
+ *
+ *   - code (the document, JS, manifest): network-first with a short timeout,
+ *     falling back to cache. Online you always get the current version; offline
+ *     or on a dying marine signal you fall back to cache after NET_TIMEOUT_MS
+ *     and carry on.
+ *   - icons: cache-first. They're static and there's no reason to pay for them.
+ *
+ * Bump CACHE_VERSION whenever a shell file changes. */
 
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const CACHE_NAME = 'speedo-' + CACHE_VERSION;
+
+const NET_TIMEOUT_MS = 2000;
 
 const SHELL = [
   './',
@@ -36,28 +49,62 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+async function networkFirst(req) {
+  const cache = await caches.open(CACHE_NAME);
+  try {
+    const res = await withTimeout(fetch(req), NET_TIMEOUT_MS);
+    if (res && res.ok) {
+      cache.put(req, res.clone()).catch(() => {});
+      return res;
+    }
+    throw new Error('bad response');
+  } catch (_) {
+    const hit = await cache.match(req);
+    if (hit) return hit;
+    // Offline, uncached, and it's a page load: hand back the shell rather than
+    // the browser's offline dinosaur.
+    if (req.mode === 'navigate') {
+      const shell = await cache.match('./index.html');
+      if (shell) return shell;
+    }
+    return new Response('', { status: 504, statusText: 'Offline' });
+  }
+}
+
+async function cacheFirst(req) {
+  const hit = await caches.match(req);
+  if (hit) return hit;
+  try {
+    const res = await fetch(req);
+    if (res && res.ok && res.type === 'basic') {
+      const cache = await caches.open(CACHE_NAME);
+      cache.put(req, res.clone()).catch(() => {});
+    }
+    return res;
+  } catch (_) {
+    return new Response('', { status: 504, statusText: 'Offline' });
+  }
+}
+
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
-  if (new URL(req.url).origin !== self.location.origin) return;
 
-  event.respondWith(
-    caches.match(req).then((hit) => {
-      if (hit) return hit;
-      return fetch(req)
-        .then((res) => {
-          if (res && res.ok && res.type === 'basic') {
-            const copy = res.clone();
-            caches.open(CACHE_NAME).then((c) => c.put(req, copy));
-          }
-          return res;
-        })
-        .catch(() => {
-          // Offline and not precached: for a page load, hand back the app shell
-          // rather than the browser's dinosaur.
-          if (req.mode === 'navigate') return caches.match('./index.html');
-          return new Response('', { status: 504, statusText: 'Offline' });
-        });
-    })
-  );
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+
+  const isCode = req.mode === 'navigate' ||
+                 /\.(?:html|js|webmanifest)$/.test(url.pathname);
+
+  event.respondWith(isCode ? networkFirst(req) : cacheFirst(req));
 });
