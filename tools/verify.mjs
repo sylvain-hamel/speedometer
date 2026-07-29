@@ -385,6 +385,48 @@ async function newPage(over = {}) {
 }
 
 /* ==========================================================================
+   3c. Wake lock refused without a gesture (what iOS actually does)
+   ========================================================================== */
+{
+  const ctx = await browser.newContext({ viewport: { width: 393, height: 852 } });
+  await ctx.addInitScript(seed({ launched: true, sim: true, wake: true }));
+
+  // Stand in for Safari: reject the request until a real tap has happened.
+  await ctx.addInitScript(() => {
+    let allow = false;
+    window.__allowWake = () => { allow = true; };
+    Object.defineProperty(navigator, 'wakeLock', {
+      configurable: true,
+      value: {
+        request: () => allow
+          ? Promise.resolve({ addEventListener() {}, release: () => Promise.resolve() })
+          : Promise.reject(new DOMException('gesture required', 'NotAllowedError')),
+      },
+    });
+  });
+
+  const page = await ctx.newPage();
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  await page.waitForTimeout(600);
+
+  const refused = await page.evaluate(() => document.getElementById('wakeHint').hidden);
+  check('wake lock refused on launch: the hint appears rather than failing silently',
+    refused === false, `hintHidden=${refused}`);
+
+  // Tap somewhere that is NOT the hint — this is the case Safari was missing.
+  await page.evaluate(() => window.__allowWake());
+  await page.click('.metrics');
+  await page.waitForTimeout(400);
+
+  const held = await page.evaluate(() => document.getElementById('wakeHint').hidden);
+  check('a tap anywhere on screen takes the lock and clears the hint',
+    held === true, `hintHidden=${held}`);
+
+  await ctx.close();
+}
+
+/* ==========================================================================
    4. Offline / PWA
    ========================================================================== */
 {
@@ -542,6 +584,17 @@ async function newPage(over = {}) {
     session: Object.keys(sessionStorage),
     cookies: document.cookie,
   }));
+  // A link that navigates the app itself would strand you: an iOS standalone
+  // web app has no back button to return from GitHub with.
+  const link = await page.evaluate(() => {
+    const a = document.getElementById('repoLink');
+    return a && { href: a.getAttribute('href'), target: a.target, rel: a.rel };
+  });
+  check('settings links to the source, and opens outside the app so it cannot strand you',
+    link && /^https:\/\/github\.com\//.test(link.href)
+      && link.target === '_blank' && link.rel.includes('noopener'),
+    JSON.stringify(link));
+
   check('privacy: stores only its own settings, and sets no cookies',
     stored.local.length === 1 && stored.local[0] === 'speedo.settings'
       && stored.session.length === 0 && stored.cookies === '',

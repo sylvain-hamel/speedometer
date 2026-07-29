@@ -619,9 +619,16 @@ async function autoStart() {
   if (!held && settings.wake && 'wakeLock' in navigator) el.wakeHint.hidden = false;
 }
 
+/* Any tap anywhere takes the lock, not just the hint button.
+ *
+ * The event list matters: Safari does not treat pointerdown as a user
+ * activation, so a pointerdown-only listener never satisfies the gesture
+ * requirement on iOS and the hint would sit there until pressed exactly.
+ * touchend and click are the ones iOS reliably counts. */
 const retryWakeLock = () => { acquireWakeLock(); };
-el.wakeHint.addEventListener('click', retryWakeLock);
-document.addEventListener('pointerdown', retryWakeLock, { passive: true });
+for (const ev of ['touchend', 'click', 'pointerup']) {
+  document.addEventListener(ev, retryWakeLock, { passive: true });
+}
 
 if (settings.launched) autoStart();
 

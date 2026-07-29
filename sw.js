@@ -5,7 +5,7 @@
  * file below changes; the new worker installs in the background and takes over
  * on the next cold launch. */
 
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const CACHE_NAME = 'speedo-' + CACHE_VERSION;
 
 const SHELL = [

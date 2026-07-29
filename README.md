@@ -55,9 +55,12 @@ into the readout and starts acquiring a fix immediately.
 Launching from the home-screen icon rather than a Safari tab is what gives you the
 full-screen view with no browser chrome.
 
-**Keeping the screen on** is automatic on iOS 16.4 and later. If the wake lock is refused,
-a small *Tap to keep screen on* prompt appears — one tap and it's held. On older iOS, set
-Settings → Display & Brightness → **Auto-Lock → Never** instead.
+**Keeping the screen on** uses the Screen Wake Lock API (iOS 16.4+). Safari generally only
+grants it off a real user gesture, so on launches that skip the start screen a small *Tap
+anywhere to keep screen on* prompt appears — one tap, anywhere on screen, and it's held.
+iOS releases the lock whenever the app is backgrounded, so it's re-taken on return. On
+older iOS there's no wake lock at all: set Settings → Display & Brightness →
+**Auto-Lock → Never** instead.
 
 If iOS re-prompts for location on every launch, choose **Allow While Using App** rather
 than *Allow Once* when the prompt appears.
@@ -138,7 +141,7 @@ npx http-server -p 8000     # or: python3 -m http.server 8000
 Plain HTML, CSS and JavaScript. No build, no dependencies, no framework.
 
 ```bash
-node tools/verify.mjs       # 29 end-to-end checks + layout screenshots
+node tools/verify.mjs       # 32 end-to-end checks + layout screenshots
 node tools/make-icons.mjs   # regenerate PNGs after editing icons/icon.svg
 ```
 
