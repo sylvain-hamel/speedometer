@@ -2,14 +2,16 @@
 
 <img src="icons/icon-192.png" width="72" align="right" alt="">
 
+### ▶ [Open the app](https://sylvain-hamel.github.io/speedometer/)
+
+<sub>sylvain-hamel.github.io/speedometer — open in Safari on iPhone, then Share → Add to Home Screen</sub>
+
 A GPS speedometer for slow-speed boating. One very large number, sized to be read at a
 glance from the helm, plus just enough detail to know whether to trust it.
 
 Built for trolling, where holding an exact speed matters and most apps bury the number
 under a map. Installs as a PWA and works with no signal — GPS is on-device, so the network
 is only needed to install and update.
-
-**→ [sylvain-hamel.github.io/speedometer](https://sylvain-hamel.github.io/speedometer/)**
 
 ## The display
 
