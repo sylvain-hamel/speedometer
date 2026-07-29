@@ -190,20 +190,6 @@ body.state-stale .status-line,
 body.state-error .status-line { opacity: 1; }
 body.state-error .status-line { color: var(--red); }
 
-/* Shown only if the wake lock was refused for want of a user gesture, so the
-   screen can't quietly go dark on you mid-troll. */
-.wake-hint {
-  margin-top: 12px;
-  font-family: inherit;
-  font-size: 13px; font-weight: 500;
-  color: var(--blue);
-  background: var(--fill-2);
-  border: 0; border-radius: 100px;
-  padding: 8px 16px;
-  cursor: pointer;
-}
-.wake-hint[hidden] { display: none; }
-
 /* --- metrics strip ------------------------------------------------------- */
 .metrics {
   display: grid;
@@ -542,7 +528,6 @@ input[type="range"]::-moz-range-thumb {
     <div class="speed-unit" id="unitLabel" role="button" tabindex="0" aria-label="Change units">MPH</div>
     <div class="target-line" id="targetLine" hidden></div>
     <div class="status-line" id="statusLine"></div>
-    <button class="wake-hint" id="wakeHint" hidden>Tap anywhere to keep screen on</button>
   </div>
 
   <div class="metrics">

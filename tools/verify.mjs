@@ -836,12 +836,15 @@ async function newPage(over = {}) {
   await ctx.addInitScript(() => {
     let allow = false;
     window.__allowWake = () => { allow = true; };
+    window.__wakeGrants = 0;
     Object.defineProperty(navigator, 'wakeLock', {
       configurable: true,
       value: {
-        request: () => allow
-          ? Promise.resolve({ addEventListener() {}, release: () => Promise.resolve() })
-          : Promise.reject(new DOMException('gesture required', 'NotAllowedError')),
+        request: () => {
+          if (!allow) return Promise.reject(new DOMException('gesture required', 'NotAllowedError'));
+          window.__wakeGrants++;
+          return Promise.resolve({ addEventListener() {}, release: () => Promise.resolve() });
+        },
       },
     });
   });
@@ -851,18 +854,95 @@ async function newPage(over = {}) {
   await page.waitForFunction(() => !!window.__speedo);
   await page.waitForTimeout(600);
 
-  const refused = await page.evaluate(() => document.getElementById('wakeHint').hidden);
-  check('wake lock refused on launch: the hint appears rather than failing silently',
-    refused === false, `hintHidden=${refused}`);
+  const refused = await page.evaluate(() => ({
+    grants: window.__wakeGrants,
+    hint: document.getElementById('wakeHint'),
+  }));
+  check('wake lock refused on launch: nothing is granted without a gesture',
+    refused.grants === 0 && refused.hint === null, JSON.stringify(refused));
 
-  // Tap somewhere that is NOT the hint — this is the case Safari was missing.
   await page.evaluate(() => window.__allowWake());
   await page.click('.metrics');
   await page.waitForTimeout(400);
 
-  const held = await page.evaluate(() => document.getElementById('wakeHint').hidden);
-  check('a tap anywhere on screen takes the lock and clears the hint',
-    held === true, `hintHidden=${held}`);
+  const held = await page.evaluate(() => window.__wakeGrants);
+  check('a tap anywhere on screen takes the lock, with nothing on screen asking for it',
+    held >= 1, `grants=${held}`);
+
+  await ctx.close();
+}
+
+/* ==========================================================================
+   3c2. Location prompt refused without a gesture — the silent one
+   ========================================================================== */
+{
+  const ctx = await browser.newContext({ viewport: { width: 393, height: 852 } });
+  await ctx.addInitScript(seed({ launched: true, sim: false, wake: false }));
+
+  // Stand in for iOS: a watch registered with no user gesture behind it is
+  // accepted and then never produces anything — no fix, no error, no timeout.
+  // Only a watch started from inside a gesture delivers. That silence is the
+  // whole problem: nothing surfaces to say the app is stuck.
+  await ctx.addInitScript(() => {
+    let gestured = false;
+    for (const ev of ['click', 'touchend']) {
+      document.addEventListener(ev, () => { gestured = true; }, true);
+    }
+    const timers = new Map();
+    let nextId = 0;
+    window.__watchCalls = 0;
+    Object.defineProperty(navigator, 'geolocation', {
+      configurable: true,
+      value: {
+        watchPosition(onOk) {
+          const id = ++nextId;
+          window.__watchCalls++;
+          if (!gestured) return id;                  // registered, silently dead
+          timers.set(id, setInterval(() => onOk({
+            timestamp: Date.now(),
+            coords: { speed: 0.5812, accuracy: 5, latitude: 45, longitude: -73 },
+          }), 250));
+          return id;
+        },
+        clearWatch(id) { clearInterval(timers.get(id)); timers.delete(id); },
+      },
+    });
+  });
+
+  const page = await ctx.newPage();
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  await page.waitForTimeout(1500);
+
+  const before = await page.evaluate(() => ({
+    speed: document.getElementById('speedValue').textContent,
+    status: document.getElementById('statusLine').textContent,
+    calls: window.__watchCalls,
+  }));
+  check('gesture-less launch: a watch iOS never answers leaves it waiting, not erroring',
+    before.speed === '--' && before.status === 'WAITING FOR FIX' && before.calls === 1,
+    JSON.stringify(before));
+
+  await page.click('.speed-value');
+  await page.waitForTimeout(1800);
+
+  const after = await page.evaluate(() => ({
+    speed: document.getElementById('speedValue').textContent,
+    status: document.getElementById('statusLine').textContent,
+    calls: window.__watchCalls,
+  }));
+  check('a tap re-arms the watch inside the gesture and the fix comes through',
+    near(parseFloat(after.speed), 1.3, 0.2) && after.calls > before.calls,
+    JSON.stringify(after));
+
+  // Once fixes are flowing, further taps must leave the watch alone — restarting
+  // a working receiver would throw away its lock for no reason.
+  const settled = await page.evaluate(() => window.__watchCalls);
+  await page.click('.speed-value');
+  await page.waitForTimeout(600);
+  const afterSettled = await page.evaluate(() => window.__watchCalls);
+  check('once fixes are arriving, tapping no longer restarts the watch',
+    afterSettled === settled, `${settled} -> ${afterSettled}`);
 
   await ctx.close();
 }

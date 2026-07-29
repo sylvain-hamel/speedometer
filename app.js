@@ -130,7 +130,6 @@ const el = {
   liveSpeed:  $('liveSpeed'),
   startOverlay: $('startOverlay'),
   startBtn:   $('startBtn'),
-  wakeHint:   $('wakeHint'),
   menuBtn:    $('menuBtn'),
   doneBtn:    $('doneBtn'),
   sheet:      $('sheet'),
@@ -785,7 +784,6 @@ async function acquireWakeLock() {
   try {
     wakeLock = await navigator.wakeLock.request('screen');
     wakeLock.addEventListener('release', () => { wakeLock = null; });
-    el.wakeHint.hidden = true;
     return true;
   } catch (_) {
     return false;   // usually "needs a user gesture" — handled by the hint
@@ -1273,25 +1271,34 @@ el.startBtn.addEventListener('click', start);
 el.startOverlay.addEventListener('click', start);
 
 /* Once the app has been through its start screen, skip it on every later
- * launch. Geolocation needs no user gesture, so the fix starts acquiring the
- * moment the app opens instead of waiting on a tap. The wake lock may still
- * want a gesture, so if it is refused we surface a small prompt and retry on
- * the first touch rather than letting the screen quietly go dark. */
+ * launch, so the fix starts acquiring the moment the app opens rather than
+ * waiting on a tap. Neither the wake lock nor the location prompt is reliably
+ * granted without a gesture behind it, so both are re-armed on the first touch
+ * (see below) instead of being left refused. */
 async function autoStart() {
   start();
-  const held = await acquireWakeLock();
-  if (!held && settings.wake && 'wakeLock' in navigator) el.wakeHint.hidden = false;
+  acquireWakeLock();
 }
 
-/* Any tap anywhere takes the lock, not just the hint button.
+/* Re-arm on the first real tap whatever iOS refused for want of a gesture.
  *
  * The event list matters: Safari does not treat pointerdown as a user
  * activation, so a pointerdown-only listener never satisfies the gesture
- * requirement on iOS and the hint would sit there until pressed exactly.
- * touchend and click are the ones iOS reliably counts. */
-const retryWakeLock = () => { acquireWakeLock(); };
+ * requirement and nothing here would ever fire on iOS. touchend and click are
+ * the ones it reliably counts. */
+const retryOnGesture = () => {
+  acquireWakeLock();
+
+  // The location prompt wants a gesture too, and iOS withholds it *silently* —
+  // no callback, no error, the watch simply never produces a thing. A launch
+  // that skips the start screen calls watchPosition with no gesture behind it,
+  // so when iOS takes that badly the app sits on WAITING FOR FIX forever with
+  // nothing on screen to say why. If the receiver has not said a word by the
+  // time a tap arrives, start the watch again from inside the gesture.
+  if (state.started && !settings.sim && !state.error && !state.lastContactAt) startGps();
+};
 for (const ev of ['touchend', 'click', 'pointerup']) {
-  document.addEventListener(ev, retryWakeLock, { passive: true });
+  document.addEventListener(ev, retryOnGesture, { passive: true });
 }
 
 if (settings.launched) autoStart();

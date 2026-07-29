@@ -133,15 +133,21 @@ nonsense like −40% for a cold spring. As tuned, the extremes are −29% and +2
 Launching from the home-screen icon rather than a Safari tab is what gives you the
 full-screen view with no browser chrome.
 
-**Keeping the screen on** uses the Screen Wake Lock API (iOS 16.4+). Safari generally only
-grants it off a real user gesture, so on launches that skip the start screen a small *Tap
-anywhere to keep screen on* prompt appears — one tap, anywhere on screen, and it's held.
-iOS releases the lock whenever the app is backgrounded, so it's re-taken on return. On
-older iOS there's no wake lock at all: set Settings → Display & Brightness →
-**Auto-Lock → Never** instead.
+**Keeping the screen on** uses the Screen Wake Lock API (iOS 16.4+). Safari only grants it
+off a real user gesture, and a launch that skips the start screen has none behind it, so the
+lock is taken on your first tap anywhere on screen instead. iOS also drops the lock whenever
+the app is backgrounded, so it's re-taken on return. On older iOS there's no wake lock at
+all: set Settings → Display & Brightness → **Auto-Lock → Never** instead.
 
-If iOS re-prompts for location on every launch, choose **Allow While Using App** rather
-than *Allow Once* when the prompt appears.
+**If it sits on `WAITING FOR FIX`, tap the screen once.** iOS applies the same
+gesture requirement to the location prompt, and withholds it silently — no fix, no error, no
+timeout, just a watch that never produces. Tapping re-arms it from inside a real gesture.
+Choosing **Allow While Using App** rather than *Allow Once* when the prompt appears avoids
+the whole situation on later launches.
+
+A first reading takes a couple of seconds beyond that: the filter deliberately waits for
+three fixes before it shows anything, because a cold GPS start often produces one wildly
+wrong value and seeding from it drags the number off for several seconds.
 
 ## Simulator
 
