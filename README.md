@@ -9,6 +9,8 @@ Built for trolling, where holding an exact speed matters and most apps bury the 
 under a map. Installs as a PWA and works with no signal — GPS is on-device, so the network
 is only needed to install and update.
 
+**→ [sylvain-hamel.github.io/speedometer](https://sylvain-hamel.github.io/speedometer/)**
+
 ## The display
 
 ```
@@ -134,7 +136,7 @@ npx http-server -p 8000     # or: python3 -m http.server 8000
 Plain HTML, CSS and JavaScript. No build, no dependencies, no framework.
 
 ```bash
-node tools/verify.mjs       # 27 end-to-end checks + layout screenshots
+node tools/verify.mjs       # 29 end-to-end checks + layout screenshots
 node tools/make-icons.mjs   # regenerate PNGs after editing icons/icon.svg
 ```
 

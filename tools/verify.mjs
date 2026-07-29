@@ -397,19 +397,24 @@ async function newPage(over = {}) {
     null, { timeout: 10000 }
   );
   await page.evaluate(() => navigator.serviceWorker.ready);
-  await page.waitForTimeout(1500);
 
-  const cached = await page.evaluate(async () => {
+  // Poll rather than sleeping a fixed amount: precaching finishes whenever it
+  // finishes, and a fixed wait makes this check flaky on a loaded machine.
+  const readCache = () => page.evaluate(async () => {
     const names = await caches.keys();
     if (!names.length) return null;
     const c = await caches.open(names[0]);
     return (await c.keys()).map((r) => new URL(r.url).pathname).sort();
   });
+  const wanted = ['app.js', 'index.html', 'icon-192.png', 'manifest.webmanifest'];
+  let cached = null;
+  for (let i = 0; i < 40; i++) {
+    cached = await readCache();
+    if (cached && wanted.every((w) => cached.some((p) => p.endsWith(w)))) break;
+    await page.waitForTimeout(250);
+  }
   check('service worker precached the whole shell',
-    cached && cached.some((p) => p.endsWith('app.js'))
-           && cached.some((p) => p.endsWith('index.html'))
-           && cached.some((p) => p.endsWith('icon-192.png'))
-           && cached.some((p) => p.endsWith('manifest.webmanifest')),
+    cached && wanted.every((w) => cached.some((p) => p.endsWith(w))),
     JSON.stringify(cached));
 
   await ctx.setOffline(true);
