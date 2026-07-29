@@ -24,8 +24,9 @@ const MEDIAN_WINDOW   = 5;      // samples; rejects single-fix GPS spikes
 const SPREAD_WINDOW_MS = 10000; // window used for the ± figure
 const SAMPLE_KEEP_MS  = 20000;  // ring buffer retention
 const DEADBAND_MS     = 0.089;  // ~0.2 MPH. Below this, show a hard 0.0
-const STALE_MS        = 10000;  // no fix for this long -> stop showing a number
-const AGING_MS        = 3000;   // fix older than this -> downgrade signal quality
+const STALE_MS        = 12000;  // no contact from the receiver at all for this long
+const AGING_MS        = 4000;   // fix older than this -> downgrade signal quality
+const STOPPED_MS      = 0.223;  // ~0.5 MPH. Below this we were moored, not moving
 const RENDER_MS       = 200;
 
 const ACC_GOOD = 10;            // metres
@@ -39,11 +40,12 @@ const SETTLE_FACTOR = 3;
 
 const DEFAULTS = {
   unit: 'mph',
-  tau: 3,                       // smoothing time constant, seconds (~9 s to settle)
+  tau: 1,                       // smoothing time constant, seconds (~3 s to settle)
   wake: true,
   sim: false,
   scenario: 'manual',
   simSpeed: 1.3,                // in whatever unit was active when set
+  launched: false,              // has the start screen been through once?
 };
 
 const SCENARIO_NOTES = {
@@ -68,6 +70,7 @@ const el = {
   liveSpeed:  $('liveSpeed'),
   startOverlay: $('startOverlay'),
   startBtn:   $('startBtn'),
+  wakeHint:   $('wakeHint'),
   menuBtn:    $('menuBtn'),
   doneBtn:    $('doneBtn'),
   sheet:      $('sheet'),
@@ -111,7 +114,8 @@ const state = {
   samples: [],        // { t, v (m/s), acc (m) }
   ema: null,          // smoothed speed, m/s
   emaAt: 0,           // timestamp of last EMA advance
-  lastFixAt: 0,
+  lastFixAt: 0,       // last *usable speed* sample
+  lastContactAt: 0,   // last time the receiver called us at all (see noteContact)
   lastRaw: null,      // most recent unfiltered speed, m/s
   lastAcc: null,
   error: null,        // human-readable fatal error, or null
@@ -137,6 +141,7 @@ function pushSample(speedMs, accuracy, when) {
   state.lastRaw = speedMs;
   state.lastAcc = accuracy;
   state.lastFixAt = t;
+  state.lastContactAt = t;
   state.error = null;
 
   const recent = state.samples.slice(-MEDIAN_WINDOW).map((s) => s.v);
@@ -152,11 +157,28 @@ function pushSample(speedMs, accuracy, when) {
   state.emaAt = t;
 }
 
+/**
+ * A position callback arrived but carried no usable speed.
+ *
+ * This matters more than it sounds. A boat sitting still produces fixes whose
+ * speed iOS reports as null, and whose position hasn't moved enough to derive
+ * one from — and Core Location throttles updates hard when nothing is moving.
+ * Treating that silence as "signal lost" makes the display flap between a
+ * number and an error every few seconds while you're tied up. Contact is
+ * therefore tracked separately from usable speed.
+ */
+function noteContact(accuracy, when) {
+  state.lastContactAt = when || Date.now();
+  if (accuracy != null) state.lastAcc = accuracy;
+  state.error = null;
+}
+
 function resetFilter() {
   state.samples.length = 0;
   state.ema = null;
   state.emaAt = 0;
   state.lastFixAt = 0;
+  state.lastContactAt = 0;
   state.lastRaw = null;
   state.lastAcc = null;
   state.error = null;
@@ -228,13 +250,18 @@ function onPosition(pos) {
     // showing nothing if the receiver withholds Doppler velocity.
     if (lastPos) {
       const dt = (t - lastPos.t) / 1000;
-      if (dt > 0.4) v = haversine(lastPos.lat, lastPos.lon, c.latitude, c.longitude) / dt;
+      if (dt > 0.2) v = haversine(lastPos.lat, lastPos.lon, c.latitude, c.longitude) / dt;
     }
   }
   lastPos = { t, lat: c.latitude, lon: c.longitude };
 
-  if (v === null) return;               // nothing usable this fix
+  if (v === null) { noteContact(c.accuracy, Date.now()); return; }
   pushSample(v, c.accuracy, t);
+
+  // Deliberately arrival time, not pos.timestamp. iOS can hand back a position
+  // carrying an older timestamp, and keying staleness off that makes a fix look
+  // expired the instant it arrives.
+  state.lastContactAt = Date.now();
 }
 
 function onGpsError(err) {
@@ -341,14 +368,22 @@ function setSpeed(text) {
 function render() {
   const now = Date.now();
   const u = UNITS[settings.unit];
-  const age = state.lastFixAt ? now - state.lastFixAt : Infinity;
-  const stale = age > STALE_MS;
+  const age = state.lastContactAt ? now - state.lastContactAt : Infinity;
+  const quiet = age > STALE_MS;
+
+  // A GPS that goes quiet while you were essentially stopped means "nothing is
+  // moving", not "signal lost" — so hold at 0.0 rather than throwing up an
+  // error. Going quiet while you were under way is the case worth shouting
+  // about, because that number would otherwise be misleading.
+  const wasMoving = state.ema !== null && state.ema >= STOPPED_MS;
+  const lost = quiet && wasMoving;
+  const stale = quiet && !wasMoving;
 
   setText(el.unitLabel, 'unit', u.label);
   setText(el.varLabel, 'varLabel', '± ' + u.label);
 
   document.body.classList.toggle('state-error', !!state.error);
-  document.body.classList.toggle('state-stale', !state.error && (stale || state.ema === null));
+  document.body.classList.toggle('state-stale', !state.error && (lost || state.ema === null));
 
   // --- the big number ---
   if (state.error) {
@@ -357,27 +392,31 @@ function render() {
   } else if (state.ema === null) {
     setSpeed('--');
     setText(el.statusLine, 'status', 'WAITING FOR FIX');
-  } else if (stale) {
+  } else if (lost) {
     // Never keep displaying an old speed as if it were live — that is the one
     // failure mode that could actually mislead you on the water.
     setSpeed('--');
     setText(el.statusLine, 'status', 'GPS SIGNAL LOST');
   } else {
-    const ms = state.ema < DEADBAND_MS ? 0 : state.ema;
+    const ms = (stale || state.ema < DEADBAND_MS) ? 0 : state.ema;
     setSpeed((ms * u.perMs).toFixed(1));
-    setText(el.statusLine, 'status', '');
+    setText(el.statusLine, 'status', stale ? 'STOPPED' : '');
   }
 
   // --- GPS accuracy + quality dot ---
   let cls = '';
-  if (!state.error && state.lastAcc != null && !stale) {
+  if (!state.error && state.lastAcc != null && !quiet) {
     const aging = age > AGING_MS;
     if (state.lastAcc <= ACC_GOOD) cls = aging ? 'fair' : 'good';
     else if (state.lastAcc <= ACC_FAIR) cls = aging ? 'poor' : 'fair';
     else cls = 'poor';
     setText(el.gpsAcc, 'acc', '±' + Math.round(state.lastAcc) + ' m');
+  } else if (!state.error && state.lastAcc != null && stale) {
+    // Moored: the fix is old but still the truth, so keep showing it, amber.
+    cls = 'fair';
+    setText(el.gpsAcc, 'acc', '±' + Math.round(state.lastAcc) + ' m');
   } else {
-    cls = state.error || stale ? 'poor' : '';
+    cls = state.error || lost ? 'poor' : '';
     setText(el.gpsAcc, 'acc', '--');
   }
   if (shown.dot !== cls) {
@@ -386,12 +425,12 @@ function render() {
   }
 
   // --- ± speed spread ---
-  const sd = stale || state.error ? null : speedSpread(now);
+  const sd = quiet || state.error ? null : speedSpread(now);
   setText(el.speedVar, 'var', sd === null ? '--' : '±' + (sd * u.perMs).toFixed(1));
 
   // --- live (unsmoothed) speed ---
-  if (state.lastRaw === null || stale || state.error) {
-    setText(el.liveSpeed, 'live', '--');
+  if (state.lastRaw === null || quiet || state.error) {
+    setText(el.liveSpeed, 'live', stale ? '0.0' : '--');
   } else {
     setText(el.liveSpeed, 'live', (state.lastRaw * u.perMs).toFixed(1));
   }
@@ -402,11 +441,16 @@ function render() {
 let wakeLock = null;
 
 async function acquireWakeLock() {
-  if (!settings.wake || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  if (!settings.wake || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return false;
+  if (wakeLock) return true;
   try {
     wakeLock = await navigator.wakeLock.request('screen');
     wakeLock.addEventListener('release', () => { wakeLock = null; });
-  } catch (_) { /* denied or unsupported — the note in Settings covers it */ }
+    el.wakeHint.hidden = true;
+    return true;
+  } catch (_) {
+    return false;   // usually "needs a user gesture" — handled by the hint
+  }
 }
 
 async function releaseWakeLock() {
@@ -552,15 +596,34 @@ function start() {
   state.started = true;
   el.startOverlay.classList.add('hidden');
 
-  // Both of these are requested inside the tap handler: iOS is far more
-  // reliable about granting the wake lock and showing the location prompt when
-  // they originate from a real user gesture.
+  if (!settings.launched) { settings.launched = true; saveSettings(); }
+
+  // Both of these are requested inside the tap handler on first run: iOS is far
+  // more reliable about granting the wake lock and showing the location prompt
+  // when they originate from a real user gesture.
   acquireWakeLock();
   if (settings.sim) startSim(); else startGps();
 }
 
 el.startBtn.addEventListener('click', start);
 el.startOverlay.addEventListener('click', start);
+
+/* Once the app has been through its start screen, skip it on every later
+ * launch. Geolocation needs no user gesture, so the fix starts acquiring the
+ * moment the app opens instead of waiting on a tap. The wake lock may still
+ * want a gesture, so if it is refused we surface a small prompt and retry on
+ * the first touch rather than letting the screen quietly go dark. */
+async function autoStart() {
+  start();
+  const held = await acquireWakeLock();
+  if (!held && settings.wake && 'wakeLock' in navigator) el.wakeHint.hidden = false;
+}
+
+const retryWakeLock = () => { acquireWakeLock(); };
+el.wakeHint.addEventListener('click', retryWakeLock);
+document.addEventListener('pointerdown', retryWakeLock, { passive: true });
+
+if (settings.launched) autoStart();
 
 document.body.classList.toggle('sim-on', settings.sim);
 syncSheet();

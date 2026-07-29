@@ -76,7 +76,10 @@ const browser = await chromium.launch({
 /* Seed settings before any script runs, so the app boots into a known state.
  * The object is built here in Node and double-encoded, so the injected script
  * is a plain literal with nothing to evaluate (and nothing to get wrong). */
-const SEED_BASE = { unit: 'mph', tau: 3, wake: false, sim: false, scenario: 'manual', simSpeed: 1.3 };
+const SEED_BASE = {
+  unit: 'mph', tau: 3, wake: false, sim: false,
+  scenario: 'manual', simSpeed: 1.3, launched: false,
+};
 const seed = (over = {}) => {
   const payload = JSON.stringify(Object.assign({}, SEED_BASE, over));
   return `localStorage.setItem('speedo.settings', ${JSON.stringify(payload)});`;
@@ -194,12 +197,51 @@ async function newPage(over = {}) {
 {
   const { ctx, page } = await newPage();
 
+  // Moored: GPS goes quiet because nothing is moving. This must NOT flap into
+  // an error — that was the "GPS signal lost every few seconds" bug.
+  const moored = await page.evaluate(() => {
+    const S = window.__speedo;
+    S.resetFilter();
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) S.pushSample(0.02, 5, now - (9 - i) * 1000);
+    S.state.lastContactAt = now - 20000;        // receiver silent for 20 s
+    S.render();
+    return {
+      speed: document.getElementById('speedValue').textContent,
+      status: document.getElementById('statusLine').textContent,
+      acc: document.getElementById('gpsAcc').textContent,
+      dot: document.getElementById('gpsDot').className,
+    };
+  });
+  check('moored + GPS quiet: holds 0.0, never claims signal lost',
+    moored.speed === '0.0' && moored.status === 'STOPPED'
+      && moored.acc === '±5 m' && moored.dot.includes('fair'),
+    JSON.stringify(moored));
+
+  // A fix carrying an older timestamp than its arrival must not read as stale
+  // the instant it lands — that was the other half of the same bug.
+  const backdated = await page.evaluate((v13) => {
+    const S = window.__speedo;
+    S.resetFilter();
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) S.pushSample(v13, 5, now - 30000 - (9 - i) * 1000);
+    S.state.lastContactAt = now;                // ...but it only just arrived
+    S.render();
+    return {
+      speed: document.getElementById('speedValue').textContent,
+      status: document.getElementById('statusLine').textContent,
+    };
+  }, mphToMs(1.3));
+  check('back-dated fix: judged on arrival time, not its own timestamp',
+    near(parseFloat(backdated.speed), 1.3, 0.06) && backdated.status === '',
+    JSON.stringify(backdated));
+
   const stale = await page.evaluate((v13) => {
     const S = window.__speedo;
     S.resetFilter();
     const now = Date.now();
     for (let i = 0; i < 10; i++) S.pushSample(v13, 5, now - (9 - i) * 1000);
-    S.state.lastFixAt = now - 15000;            // fix went quiet 15 s ago
+    S.state.lastContactAt = now - 20000;        // under way, then went quiet
     S.render();
     return {
       speed: document.getElementById('speedValue').textContent,
@@ -209,9 +251,9 @@ async function newPage(over = {}) {
       dot: document.getElementById('gpsDot').className,
     };
   }, mphToMs(1.3));
-  check('stale fix: number blanks instead of showing an old speed as live',
+  check('under way then signal lost: blanks instead of showing an old speed as live',
     stale.speed === '--' && stale.status === 'GPS SIGNAL LOST', JSON.stringify(stale));
-  check('stale fix: every secondary readout blanks too',
+  check('under way then signal lost: every secondary readout blanks too',
     stale.live === '--' && stale.acc === '--' && stale.dot.includes('poor'),
     JSON.stringify(stale));
 
@@ -306,6 +348,39 @@ async function newPage(over = {}) {
     after.sim === true && after.unit === 'kn' && after.label === 'KN',
     JSON.stringify(after));
 
+  await ctx.close();
+}
+
+/* ==========================================================================
+   3b. Start screen shows once, then gets out of the way
+   ========================================================================== */
+{
+  const { ctx, page } = await newPage();                 // launched: false
+  const first = await page.evaluate(() => ({
+    overlayShown: !document.getElementById('startOverlay').classList.contains('hidden'),
+    started: window.__speedo.state.started,
+  }));
+  check('first run: start screen is shown and nothing begins until tapped',
+    first.overlayShown && first.started === false, JSON.stringify(first));
+
+  await page.click('#startBtn');
+  const marked = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('speedo.settings')).launched);
+  check('first run: tapping Start records that it has been through once',
+    marked === true, `launched=${marked}`);
+  await ctx.close();
+}
+{
+  const { ctx, page } = await newPage({ launched: true, sim: true });
+  await page.waitForTimeout(4000);                       // no click at all
+  const relaunch = await page.evaluate(() => ({
+    overlayShown: !document.getElementById('startOverlay').classList.contains('hidden'),
+    started: window.__speedo.state.started,
+    speed: document.getElementById('speedValue').textContent,
+  }));
+  check('relaunch: start screen skipped, fix acquiring immediately with no tap',
+    !relaunch.overlayShown && relaunch.started === true
+      && /^\d+\.\d$/.test(relaunch.speed), JSON.stringify(relaunch));
   await ctx.close();
 }
 
@@ -424,6 +499,48 @@ async function newPage(over = {}) {
 
   check('no console errors or exceptions while driving every control',
     problems.length === 0, problems.join(' | '));
+
+  await ctx.close();
+}
+
+/* ==========================================================================
+   4d. Privacy: the app must never talk to anyone
+   ========================================================================== */
+{
+  const ctx = await browser.newContext({ viewport: { width: 393, height: 852 } });
+  const page = await ctx.newPage();
+
+  const external = [];
+  const origin = new URL(BASE).origin;
+  ctx.on('request', (r) => {
+    const url = r.url();
+    if (url.startsWith('data:') || url.startsWith('blob:')) return;
+    if (new URL(url).origin !== origin) external.push(r.method() + ' ' + url);
+  });
+
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForFunction(() => !!window.__speedo);
+  await page.click('#startBtn');
+  await page.click('#menuBtn');
+  await page.waitForTimeout(400);
+  await page.click('#simToggle');
+  await page.click('[data-scenario="troll"]');
+  await page.click('#doneBtn');
+  await page.waitForTimeout(4000);
+
+  check('privacy: zero cross-origin requests — no analytics, CDN, fonts or beacons',
+    external.length === 0, external.join(' | '));
+
+  // Nothing but the user's own settings should ever be written to storage.
+  const stored = await page.evaluate(() => ({
+    local: Object.keys(localStorage),
+    session: Object.keys(sessionStorage),
+    cookies: document.cookie,
+  }));
+  check('privacy: stores only its own settings, and sets no cookies',
+    stored.local.length === 1 && stored.local[0] === 'speedo.settings'
+      && stored.session.length === 0 && stored.cookies === '',
+    JSON.stringify(stored));
 
   await ctx.close();
 }
